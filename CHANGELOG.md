@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- New board `digispark` and chip `attiny85`: the ATtiny85 USB boards from
+  Digistump and their many clones. `dodo run` writes the program through the
+  board's micronucleus bootloader (versions 1.x and 2.x) itself, over USB
+  control requests on macOS (IOKit) and Linux (usbfs), so neither the
+  micronucleus tool nor libusb is needed: run it, then plug the board in.
+  `std/embedded/chip/attiny85` and `std/embedded/board/digispark` cover the
+  pins, a transmit-only serial port the runtime times itself on any pin, I2C
+  and SPI on the USI, PWM on Timer 0 and Timer 1, the ADC and temperature
+  sensor, the watchdog, the EEPROM, and `reboot_to_bootloader()`. The
+  ATtiny85's core has no MUL instruction: its runtime multiplies, and
+  divides 32-bit values, in compact assembly, and counts microseconds in the
+  timer interrupt so that reading the time needs no 64-bit arithmetic; the
+  blink example takes 746 of the 6012 bytes the bootloader leaves.
+  `examples/digispark_breathe.dodo` fades the LED, and
+  `scripts/test_digispark.py` runs the on-board self-test, which reports
+  through the timing of the bootloader's return, as the board has no other
+  way to talk to the computer.
 - The code generators for the math constants, Brotli tables, bitmap and
   TrueType test fonts, sRGB tables, and the OpenGL and Vulkan bindings are
   now Dodo programs in `scripts/gen/` (`dodo run scripts/gen/<name>.dodo --

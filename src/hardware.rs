@@ -24,15 +24,18 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 
 mod atmega328p;
+mod attiny85;
 pub mod avr;
 mod esp32c6;
 pub mod esp32c6_lp;
 pub mod esp_flash;
 pub mod image;
+pub mod micronucleus;
 mod rp2040;
 mod rp2350;
 pub mod serial;
 pub mod stk500;
+pub mod usb;
 
 #[derive(Debug)]
 pub struct Chip {
@@ -125,6 +128,10 @@ pub enum ImageFormat {
         page_size: u16,
         baud: u32,
     },
+    /// Intel HEX of the flash contents, which `dodo run` writes through the
+    /// micronucleus USB bootloader (see [`micronucleus`]) of a chip with the
+    /// device `signature` and flash pages of `page_size` bytes.
+    Micronucleus { signature: [u8; 3], page_size: u16 },
     /// The program of a coprocessor on chip `host`, such as the ESP32-C6's
     /// LP core: the contents of its memory from the region's origin, which
     /// a `host` firmware embeds (`lp-core = "PATH"`) and loads; never
@@ -148,6 +155,7 @@ pub static CHIPS: &[&Chip] = &[
     &esp32c6::CHIP,
     &esp32c6_lp::CHIP,
     &atmega328p::CHIP,
+    &attiny85::CHIP,
 ];
 
 pub static BOARDS: &[Board] = &[
@@ -186,6 +194,16 @@ pub static BOARDS: &[Board] = &[
         // Optiboot takes the top 512 bytes.
         flash_size: 32 * 1024 - 512,
         package: "std/embedded/board/arduino_uno",
+    },
+    Board {
+        name: "digispark",
+        description: "Digispark",
+        chip: &attiny85::CHIP,
+        // Micronucleus 1.x takes the top 2 KiB, less the 4 bytes below it
+        // where it keeps the program's reset and PCINT0 vectors; version 2
+        // bootloaders leave more, of which this uses the same part.
+        flash_size: 6012,
+        package: "std/embedded/board/digispark",
     },
 ];
 
@@ -279,7 +297,7 @@ impl Platform {
         match self.chip.image {
             ImageFormat::Uf2 { .. } => "uf2",
             ImageFormat::EspFlash { .. } => "bin",
-            ImageFormat::Stk500 { .. } => "hex",
+            ImageFormat::Stk500 { .. } | ImageFormat::Micronucleus { .. } => "hex",
             ImageFormat::Coprocessor { .. } => "bin",
         }
     }
@@ -308,7 +326,7 @@ impl Platform {
             ImageFormat::EspFlash { .. } | ImageFormat::Coprocessor { .. } => {
                 image::flat(elf, &segments, flash.origin)
             }
-            ImageFormat::Stk500 { .. } => {
+            ImageFormat::Stk500 { .. } | ImageFormat::Micronucleus { .. } => {
                 avr::intel_hex(&image::flat(elf, &segments, flash.origin), flash.origin)
                     .into_bytes()
             }
@@ -321,7 +339,7 @@ impl Platform {
         match self.chip.image {
             ImageFormat::Uf2 { drive_id, .. } => image::uf2_drives(drive_id),
             ImageFormat::EspFlash { .. } => vec![],
-            ImageFormat::Stk500 { .. } => vec![],
+            ImageFormat::Stk500 { .. } | ImageFormat::Micronucleus { .. } => vec![],
             ImageFormat::Coprocessor { .. } => vec![],
         }
     }
@@ -330,7 +348,7 @@ impl Platform {
         match self.chip.image {
             ImageFormat::Uf2 { drive_id, .. } => drive_id,
             ImageFormat::EspFlash { .. } => "",
-            ImageFormat::Stk500 { .. } => "",
+            ImageFormat::Stk500 { .. } | ImageFormat::Micronucleus { .. } => "",
             ImageFormat::Coprocessor { .. } => "",
         }
     }
@@ -389,7 +407,9 @@ mod tests {
         assert!(
             Platform::select(None, Some("rp2041"))
                 .unwrap_err()
-                .contains("available chips: rp2040, rp2350, esp32c6, esp32c6_lp, atmega328p")
+                .contains(
+                    "available chips: rp2040, rp2350, esp32c6, esp32c6_lp, atmega328p, attiny85"
+                )
         );
     }
 
@@ -479,11 +499,16 @@ mod tests {
             assert_eq!(weak, chip.interrupts, "{}", chip.name);
             // The ESP32-C6's handlers follow its dispatch table's label;
             // Cortex-M tables hold addresses, mixing the IRQs with exception
-            // handlers; AVR's hold a jmp per vector.
+            // handlers; AVR's hold a jmp or rjmp per vector.
             let dispatched = chip.interrupt_abi == InterruptAbi::Dispatched;
             let jumps = runtime
                 .lines()
-                .filter_map(|line| line.strip_prefix("module asm \"    jmp "))
+                .skip_while(|line| !line.contains("\"__vectors:\""))
+                .skip(1)
+                .map_while(|line| {
+                    line.strip_prefix("module asm \"    jmp ")
+                        .or_else(|| line.strip_prefix("module asm \"    rjmp "))
+                })
                 .map(|name| name.trim_end_matches('"'))
                 .filter(|&name| name != "__reset");
             let lines: Vec<&str> = if dispatched {
@@ -586,6 +611,39 @@ mod tests {
         assert!(platform.finish(&mut file).unwrap_err().contains("outside"));
         let custom = Platform::select(None, Some("atmega328p")).unwrap().unwrap();
         assert_eq!(custom.flash().length, 32 * 1024);
+    }
+
+    #[test]
+    fn digispark_images_are_intel_hex_with_relative_vectors() {
+        let platform = Platform::select(Some("digispark"), None).unwrap().unwrap();
+        assert_eq!(platform.chip.name, "attiny85");
+        assert_eq!(platform.image_extension(), "hex");
+        let script = platform.linker_script();
+        assert!(script.contains("FLASH (rx) : ORIGIN = 0x00000000, LENGTH = 0x177c"));
+        assert!(script.contains("RAM (rwx) : ORIGIN = 0x00800060, LENGTH = 0x200"));
+        // rjmp .+28 at reset, rjmp to itself elsewhere.
+        let mut vectors = vec![];
+        for word in [0xC00Eu16, 0xCFFF, 0xCFFF] {
+            vectors.extend_from_slice(&word.to_le_bytes());
+        }
+        vectors.resize(30, 0xFF);
+        let mut file = elf(&[(0, &vectors)]);
+        let image = String::from_utf8(platform.finish(&mut file).unwrap()).unwrap();
+        // The record leaves out the erased bytes after the three vectors.
+        assert!(image.starts_with(":060000000EC0FFCFFFCF"));
+        let mut far = vectors.clone();
+        far[..4].copy_from_slice(&[0x0C, 0x94, 0x0F, 0x00]);
+        let mut file = elf(&[(0, &far)]);
+        let error = platform.finish(&mut file).unwrap_err();
+        assert!(error.contains("reset vector is not an rjmp"), "{error}");
+        let mut pcint = vectors.clone();
+        pcint[4..6].copy_from_slice(&[0, 0]);
+        let mut file = elf(&[(0, &pcint)]);
+        assert!(platform.finish(&mut file).unwrap_err().contains("PCINT0"));
+        let mut file = elf(&[(0, &vectors), (6012, &[1])]);
+        assert!(platform.finish(&mut file).unwrap_err().contains("outside"));
+        let custom = Platform::select(None, Some("attiny85")).unwrap().unwrap();
+        assert_eq!(custom.flash().length, 8 * 1024);
     }
 
     #[test]

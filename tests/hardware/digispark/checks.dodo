@@ -1,0 +1,109 @@
+package checks
+
+import "core/mmio"
+import "core/ptr"
+import "std/embedded/board"
+
+// What the Digispark self-tests share: counting checks, values the
+// optimizer cannot see through, so the runtime helpers really run, and
+// reporting the result without a serial port.
+//
+// The board has no way to send data to the computer, so `finish` reports
+// through the bootloader: it starts it again 3 s + 2 s * N after take(),
+// where N is the number of the first failed check (0 if all passed), and
+// scripts/test_digispark.py measures when it reappears on USB. Meanwhile
+// the LED blinks quickly if every check passed and slowly otherwise.
+
+static mut TOTAL: u8 = 0
+static mut FIRST_FAILED: u8 = 0
+
+unsafe extern "C" fn dodo_avr_micros() -> u64
+
+// Count a check, and remember the first that failed.
+@inline(never)
+pub fn check(passed: bool) {
+    number := unsafe {
+        TOTAL += 1
+        TOTAL
+    }
+    if !passed {
+        unsafe {
+            if FIRST_FAILED == 0 {
+                FIRST_FAILED = number
+            }
+        }
+    }
+}
+
+// Report the result as above, then start the bootloader.
+pub fn finish() {
+    code := unsafe {
+        FIRST_FAILED
+    } as u32
+    // Microseconds since take(), whose low 32 bits last 71 minutes.
+    deadline := (3 + 2 * code) * 1_000_000
+    blink := 100_000u32
+    if code != 0 {
+        blink = 500_000
+    }
+    next := 0u32
+    for {
+        now := unsafe {
+            (dodo_avr_micros() & 0xFFFF_FFFF) as u32
+        }
+        if now >= deadline {
+            break
+        }
+        if now >= next {
+            // The LED pin (PB1) as an output, toggled through PINB.
+            unsafe {
+                mmio.write8(0x37, mmio.read8(0x37) | 0x02)
+                mmio.write8(0x36, 0x02)
+            }
+            next = now + blink
+        }
+    }
+    board.reboot_to_bootloader()
+}
+
+pub fn opaque8(value: u8) -> u8 {
+    slot := value
+    unsafe {
+        return ptr.read_volatile(ptr.from_ref(&slot))
+    }
+}
+
+pub fn opaque16(value: u16) -> u16 {
+    slot := value
+    unsafe {
+        return ptr.read_volatile(ptr.from_ref(&slot))
+    }
+}
+
+pub fn opaque32(value: u32) -> u32 {
+    slot := value
+    unsafe {
+        return ptr.read_volatile(ptr.from_ref(&slot))
+    }
+}
+
+pub fn opaque64(value: u64) -> u64 {
+    slot := value
+    unsafe {
+        return ptr.read_volatile(ptr.from_ref(&slot))
+    }
+}
+
+pub fn opaque_i32(value: i32) -> i32 {
+    slot := value
+    unsafe {
+        return ptr.read_volatile(ptr.from_ref(&slot))
+    }
+}
+
+pub fn opaque_f32(value: f32) -> f32 {
+    slot := value
+    unsafe {
+        return ptr.read_volatile(ptr.from_ref(&slot))
+    }
+}

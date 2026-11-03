@@ -1,0 +1,77 @@
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/io"
+
+// Fades a Digispark's LED in and out with PWM, and every few breaths
+// writes the chip's temperature to a serial port on P2, which a USB serial
+// adapter (its RX to P2, and ground to GND) shows at 9600 baud. Flash it,
+// plugging the board in when asked:
+//
+//     dodo run examples/digispark_breathe.dodo --board digispark
+//     screen /dev/cu.usbserial* 9600
+//
+// The LED's pin, P1, is one of Timer 1's PWM outputs, so the board's `led`
+// pin is released and taken again as a PWM output.
+fn main() {
+    b := board.take()!
+    let board.Board { led: led, pins: parts, timer: clock, watchdog: watchdog, eeprom: eeprom } = b
+    pins := parts
+    timer := clock
+    pins.release(led)
+    // 500 Hz is too fast to see flicker; Timer 1 makes it with 128 steps.
+    lamp := pins.pwm(board.LED_PIN, 500)!
+    sensor := pins.temperature()!
+    serial := pins.uart(board.UART_TX_PIN, none, 9600)!
+    serial.set_crlf(true)
+    max := lamp.max_duty()
+    breaths := 0u16
+    for {
+        // Brightness follows a triangle, squared so the eye sees it change
+        // evenly. 16-bit arithmetic is the cheap kind on this chip.
+        for step in 0u16..256 {
+            level := step
+            if step >= 128 {
+                level = 255 - step
+            }
+            lamp.set_duty((level * level >> 6) * max >> 8)!
+            timer.delay_ms(12)
+        }
+        breaths += 1
+        if breaths % 4 == 0 {
+            reading := sensor.read()!
+            celsius := chip.millicelsius(reading) / 1000
+            io.write_all(&mut serial, b"breath ")!
+            write_number(&mut serial, breaths as i32)!
+            io.write_all(&mut serial, b", ")!
+            write_number(&mut serial, celsius)!
+            io.write_all(&mut serial, b" C\n")!
+        }
+    }
+}
+
+// Write `value` in decimal. std/fmt's printf would do, but its 64-bit
+// number formatting takes more than half of the Digispark's flash.
+fn write_number(serial: &mut chip.Serial, value: i32) -> void!io.Error {
+    digits: [11]u8 = [0u8; 11]
+    position := 11usize
+    rest := value
+    if value < 0 {
+        rest = -value
+    }
+    for {
+        position -= 1
+        digits[position] = (48 + rest % 10) as u8
+        rest = rest / 10
+        if rest == 0 {
+            break
+        }
+    }
+    if value < 0 {
+        position -= 1
+        digits[position] = 45
+    }
+    io.write_all(serial, &digits[position..])?
+    return ok()
+}

@@ -1,4 +1,4 @@
-; AVR runtime helpers for the ATmega chip runtimes. The compiler appends this
+; AVR runtime helpers for the AVR chip runtimes. The compiler appends this
 ; file to a chip's startup runtime (see `src/hardware/CHIP.rs`), so it is
 ; compiled for that chip's CPU, with the data layout the runtime declares.
 ;
@@ -8,6 +8,9 @@
 ; the operations the AVR backend does not expand inline. All are weak and
 ; --gc-sections drops the unused ones. There is no avr-libc or libgcc.
 ;
+; The 32-bit division entry points, __udivmodsi4 and __divmodsi4, come from
+; avr_mul.ll or avr_nomul.ll with the multiplication helpers.
+;
 ; The 8-, 16- and 32-bit division helpers use the AVR builtin calling
 ; convention (calling convention 87 in LLVM IR), as libgcc's do: dividend
 ; and divisor in r24/r22 (8-bit), r25:r24/r23:r22 (16-bit) or r25-r22 /
@@ -16,9 +19,8 @@
 ; ordinary AVR calling convention.
 ;
 ; This module is not optimized by the IR pass pipeline, so the helpers below
-; are never rewritten into calls to themselves: they multiply only 8-bit
-; values (the MUL instruction) or call a narrower helper, and divide by
-; shifting and subtracting.
+; are never rewritten into calls to themselves: they multiply by calling a
+; narrower helper, and divide by shifting and subtracting.
 
 attributes #10 = { nounwind "no-builtins" }
 
@@ -374,14 +376,6 @@ define weak cc 87 { i16, i16 } @__divmodhi4(i16 %n, i16 %d) #10 {
   %u = call { i16, i16 } @avr_divmod16(i16 %n, i16 %d)
   ret { i16, i16 } %u
 }
-define weak cc 87 { i32, i32 } @__udivmodsi4(i32 %n, i32 %d) #10 {
-  %u = call { i32, i32 } @avr_udivmod32(i32 %n, i32 %d)
-  ret { i32, i32 } %u
-}
-define weak cc 87 { i32, i32 } @__divmodsi4(i32 %n, i32 %d) #10 {
-  %u = call { i32, i32 } @avr_divmod32(i32 %n, i32 %d)
-  ret { i32, i32 } %u
-}
 
 define weak i64 @__udivdi3(i64 %n, i64 %d) #10 {
   %u = call { i64, i64 } @avr_udivmod64(i64 %n, i64 %d)
@@ -417,54 +411,11 @@ done:
 }
 
 ; ---------------------------------------------------------------------------
-; Multiplication. The ATmega's MUL multiplies two bytes into 16 bits, which
-; LLVM uses for 8- and 16-bit products; wider ones are built from those.
-
-; The full 32-bit product of two 16-bit values, from four byte products.
-define internal i32 @avr_umul16x16(i16 %x, i16 %y) #10 {
-  %x0.b = trunc i16 %x to i8
-  %x1.w = lshr i16 %x, 8
-  %x1.b = trunc i16 %x1.w to i8
-  %y0.b = trunc i16 %y to i8
-  %y1.w = lshr i16 %y, 8
-  %y1.b = trunc i16 %y1.w to i8
-  %x0 = zext i8 %x0.b to i16
-  %x1 = zext i8 %x1.b to i16
-  %y0 = zext i8 %y0.b to i16
-  %y1 = zext i8 %y1.b to i16
-  %p00 = mul i16 %x0, %y0
-  %p01 = mul i16 %x0, %y1
-  %p10 = mul i16 %x1, %y0
-  %p11 = mul i16 %x1, %y1
-  %w00 = zext i16 %p00 to i32
-  %w01 = zext i16 %p01 to i32
-  %w10 = zext i16 %p10 to i32
-  %w11 = zext i16 %p11 to i32
-  %s01 = shl i32 %w01, 8
-  %s10 = shl i32 %w10, 8
-  %s11 = shl i32 %w11, 16
-  %a = add i32 %w00, %s01
-  %b = add i32 %a, %s10
-  %c = add i32 %b, %s11
-  ret i32 %c
-}
-
-define weak i32 @__mulsi3(i32 %a, i32 %b) #10 {
-  %al = trunc i32 %a to i16
-  %ah.w = lshr i32 %a, 16
-  %ah = trunc i32 %ah.w to i16
-  %bl = trunc i32 %b to i16
-  %bh.w = lshr i32 %b, 16
-  %bh = trunc i32 %bh.w to i16
-  %low = call i32 @avr_umul16x16(i16 %al, i16 %bl)
-  %c1 = mul i16 %al, %bh
-  %c2 = mul i16 %ah, %bl
-  %cross = add i16 %c1, %c2
-  %cross32 = zext i16 %cross to i32
-  %high = shl i32 %cross32, 16
-  %result = add i32 %low, %high
-  ret i32 %result
-}
+; Multiplication. LLVM multiplies 8- and 16-bit values with the MUL
+; instruction on chips that have it and calls __mulqi3 and __mulhi3 on those
+; that do not; __mulsi3 comes from avr_mul.ll or avr_mul_soft.ll, whichever
+; fits the chip (see `src/hardware/avr.rs`). The wider products below are
+; built from __mulsi3.
 
 ; The full 64-bit product of two 32-bit values; its 32-bit products call
 ; __mulsi3.

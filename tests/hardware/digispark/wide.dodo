@@ -1,0 +1,79 @@
+package main
+
+import "checks"
+import "core/mmio"
+import "std/embedded/board"
+import "std/embedded/hal"
+import "std/sync/atomic"
+
+// Digispark self-test, part two: the 64-bit integer and atomic helpers,
+// function values in program memory, and critical sections (see core.dodo
+// for how the result is reported).
+
+static COUNTER: atomic.Atomic<u16> = atomic.Atomic.new(0u16)
+
+fn triple(value: u32) -> u32 {
+    return value * 3
+}
+
+fn square(value: u32) -> u32 {
+    return value * value
+}
+
+fn apply(function: fn(u32) -> u32, value: u32) -> u32 {
+    return function(value)
+}
+
+fn apply_closure(function: &dyn fn(u32) -> u32, value: u32) -> u32 {
+    return function(value)
+}
+
+fn main() {
+    b := board.take()!
+    wide_checks()
+    function_checks()
+    atomic_checks()
+    checks.finish()
+}
+
+@inline(never)
+fn wide_checks() {
+    wide := checks.opaque64(4_294_967_291) * checks.opaque64(4_294_967_279)
+    checks.check(wide == 18_446_743_979_220_271_189)
+    quotient := checks.opaque64(18_446_744_073_709_551_557) / checks.opaque64(1_000_000_007)
+    remainder := checks.opaque64(18_446_744_073_709_551_557) % checks.opaque64(1_000_000_007)
+    checks.check(quotient == 18_446_743_944 && remainder == 582_343_949)
+}
+
+// Function values, closures and dynamic dispatch, whose code addresses are
+// word addresses in program memory.
+@inline(never)
+fn function_checks() {
+    functions: [2]fn(u32) -> u32 = [triple, square]
+    picked := functions[(checks.opaque32(1) & 1) as usize]
+    checks.check(apply(triple, 14) == 42 && apply(picked, 9) == 81)
+    offset := checks.opaque32(5)
+    checks.check(apply_closure(fn(x) {
+        x * 2 + offset
+    }, 10) == 25)
+    checks.check(apply_closure(triple, 7) == 21)
+}
+
+@inline(never)
+fn atomic_checks() {
+    COUNTER.store(65_534u16, atomic.Ordering.SeqCst)!
+    previous := COUNTER.fetch_add(3u16, atomic.Ordering.SeqCst)!
+    swapped := COUNTER.exchange(100u16, atomic.Ordering.SeqCst)!
+    exchanged := COUNTER.compare_exchange(100u16, 7u16, atomic.Ordering.SeqCst, atomic.Ordering.SeqCst)!
+    value := COUNTER.load(atomic.Ordering.SeqCst)!
+    checks.check(previous == 65_534 && swapped == 1 && exchanged.exchanged && value == 7)
+    section := hal.Critical.enter()
+    masked := (unsafe {
+        mmio.read8(0x5F)
+    } & 0x80) == 0
+    core.drop(section)
+    unmasked := (unsafe {
+        mmio.read8(0x5F)
+    } & 0x80) != 0
+    checks.check(masked && unmasked)
+}

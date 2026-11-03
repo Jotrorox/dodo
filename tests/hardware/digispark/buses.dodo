@@ -1,0 +1,74 @@
+package main
+
+import "checks"
+import "core/mmio"
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/hal"
+
+// Digispark self-test, part five: std/embedded/chip/attiny85's serial
+// port, which the checks time, and the USI's I2C and SPI controllers (see
+// core.dodo for how the result is reported). Nothing needs to be wired to
+// the board: no I2C device answers, and SPI only sends.
+
+fn main() {
+    b := board.take()!
+    let board.Board { led: led, pins: parts, timer: clock, watchdog: watchdog, eeprom: eeprom } = b
+    pins := parts
+    timer := clock
+    pins.release(led)
+    serial_checks(&mut pins, &mut timer)
+    bus_checks(&mut pins)
+    checks.finish()
+}
+
+@inline(never)
+fn serial_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    port := pins.uart(board.UART_TX_PIN, none, 9600)!
+    text := b"0123456789"
+    start := timer.now_us()
+    port.write(text)!
+    elapsed := ((timer.now_us() - start) & 0xFFFF_FFFF) as u32
+    // Ten frames of ten bits: 10.42 ms.
+    checks.check(elapsed > 10_100 && elapsed < 10_750 && port.baud() == 9600)
+    idle := (unsafe {
+        mmio.read8(0x36)
+    } & 0x04) != 0
+    pins.release_uart(port)
+    fast := pins.uart(board.UART_TX_PIN, none, 115_200)!
+    start = timer.now_us()
+    fast.write(text)!
+    fast.write(text)!
+    elapsed = ((timer.now_us() - start) & 0xFFFF_FFFF) as u32
+    pins.release_uart(fast)
+    // Twenty frames: 1.74 ms.
+    checks.check(idle && elapsed > 1650 && elapsed < 1850)
+    checks.check(match pins.uart(board.UART_TX_PIN, some(board.P5), 9600) {
+        ok(_) => false,
+        err(error) => error == hal.Error.InvalidInput,
+    })
+}
+
+@inline(never)
+fn bus_checks(pins: &mut chip.Pins) {
+    // No device answers on a bus without pull-ups.
+    i2c := pins.i2c(board.I2C_SDA_PIN, board.I2C_SCL_PIN, hal.I2C_STANDARD_HZ)!
+    checks.check(match i2c.write(0x50, b"x") {
+        ok() => false,
+        err(error) => error == hal.Error.NoAcknowledge || error == hal.Error.Timeout,
+    })
+    checks.check(match pins.spi(board.SPI_CLOCK_PIN, board.SPI_TX_PIN, none, hal.SpiMode.Mode0, 1_000_000) {
+        ok(_) => false,
+        err(error) => error == hal.Error.Busy,
+    })
+    pins.release_i2c(i2c)
+    // Mode 3 idles with the clock high; a byte takes 16 edges.
+    spi := pins.spi(board.SPI_CLOCK_PIN, board.SPI_TX_PIN, none, hal.SpiMode.Mode3, 500_000)!
+    data: [2]u8 = [0xA5, 0x0F]
+    spi.transfer(&mut data)!
+    high := (unsafe {
+        mmio.read8(0x36)
+    } & 0x04) != 0
+    pins.release_spi(spi)
+    checks.check(high)
+}

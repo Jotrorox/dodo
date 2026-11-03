@@ -1,0 +1,137 @@
+package main
+
+import "checks"
+import "core/mmio"
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/hal"
+import "std/sync/atomic"
+
+// Digispark self-test, part one: the ATtiny85 startup runtime, the time
+// base, its software multiplication and its 8- to 32-bit division, and the
+// code generator's AVR specifics: interrupt handlers and panic messages in
+// flash, which the last check reaches through a panic hook of its own.
+// wide.dodo tests the 64-bit integer, atomic and binary32 conversion
+// helpers, function values and critical sections, float.dodo binary32
+// arithmetic, and peripherals.dodo std/embedded/chip/attiny85's
+// peripherals; together they do not fit the flash. Nothing needs to be
+// wired to the board.
+//
+// There is no serial port to report on: checks.finish encodes the first
+// failed check in when the bootloader returns, which
+// scripts/test_digispark.py measures. The checks are numbered in order,
+// from 1.
+
+// Initialized data and zeroed statics: the reset code copies and clears them.
+static mut DATA: [3]u16 = [0xBEEFu16, 7, 0x1234]
+static mut ZEROED: [4]u8 = [0u8; 4]
+// Counted by the TIMER1_COMPA handler.
+static TICKS: atomic.Atomic<u16> = atomic.Atomic.new(0u16)
+// The line of the overflow the panic hook expects.
+const PANIC_LINE: u32 = 58
+
+@interrupt(TIMER1_COMPA)
+fn tick() {
+    TICKS.fetch_add(1u16, atomic.Ordering.SeqCst)!
+}
+
+// The last check: an overflow reaches the panic hook with its message and
+// file name in flash.
+extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
+    address := unsafe {
+        check as usize
+    }
+    // "arithmetic overflow"
+    first := chip.flash_byte((address & 0xFFFF) as u16)
+    fifth := chip.flash_byte(((address + 4) & 0xFFFF) as u16)
+    checks.check(first == 97 && fifth == 104 && line == PANIC_LINE)
+    checks.finish()
+}
+
+fn main() {
+    b := board.take()!
+    startup_checks(&mut b)
+    time_checks(&mut b)
+    integer_checks()
+    interrupt_checks(&mut b)
+    limit := checks.opaque32(4_000_000_000)
+    overflow := limit + limit
+    checks.check(overflow == 0)
+    checks.finish()
+}
+
+@inline(never)
+fn startup_checks(b: &mut board.Board) {
+    checks.check(match board.take() {
+        ok(_) => false,
+        err(error) => error == hal.Error.Busy,
+    })
+    data := unsafe {
+        DATA[0] as u32 + DATA[1] as u32 + DATA[2] as u32
+    }
+    checks.check(data == 0xBEEF + 7 + 0x1234)
+    zeroed := unsafe {
+        ZEROED[0] as u32 + ZEROED[3] as u32
+    }
+    checks.check(zeroed == 0)
+    checks.check(match b.pins.output(board.LED_PIN) {
+        ok(_) => false,
+        err(error) => error == hal.Error.Busy,
+    })
+    checks.check(match b.pins.output(6) {
+        ok(_) => false,
+        err(error) => error == hal.Error.InvalidInput,
+    })
+}
+
+@inline(never)
+fn time_checks(b: &mut board.Board) {
+    start := b.timer.now_us()
+    b.timer.delay_ms(100)
+    elapsed := (b.timer.now_us() - start) as u32
+    checks.check(elapsed >= 99_000 && elapsed <= 103_000)
+    start = b.timer.now_us()
+    b.timer.delay_us(2000)
+    elapsed = (b.timer.now_us() - start) as u32
+    checks.check(elapsed >= 1940 && elapsed <= 2150)
+}
+
+@inline(never)
+fn integer_checks() {
+    q := checks.opaque32(1_000_000_007) / checks.opaque32(97)
+    r := checks.opaque32(1_000_000_007) % checks.opaque32(97)
+    checks.check(q == 10_309_278 && r == 41)
+    sq := checks.opaque_i32(-1_000_000_007) / checks.opaque_i32(97)
+    sr := checks.opaque_i32(-1_000_000_007) % checks.opaque_i32(97)
+    checks.check(sq == -10_309_278 && sr == -41)
+    product := checks.opaque32(65_521) * checks.opaque32(65_519)
+    checks.check(product == 4_292_870_399)
+    signed := checks.opaque_i32(-46_341) * checks.opaque_i32(46_340)
+    checks.check(signed == -2_147_441_940)
+    small := checks.opaque8(200) / checks.opaque8(7)
+    small16 := checks.opaque16(60_000) % checks.opaque16(7)
+    checks.check(small == 28 && small16 == 3)
+    byte := checks.opaque8(13) * checks.opaque8(19)
+    word := checks.opaque16(251) * checks.opaque16(261)
+    checks.check(byte == 247 && word == 65_511)
+}
+
+// An interrupt handler: Timer 1 compare match A at about 1 kHz (the clock
+// divided by 128, cleared after 129 counts).
+@inline(never)
+fn interrupt_checks(b: &mut board.Board) {
+    unsafe {
+        mmio.write8(0x40, mmio.read8(0x40) & 0xF7)
+        mmio.write8(0x4D, 128)
+        mmio.write8(0x4E, 128)
+        mmio.write8(0x59, mmio.read8(0x59) | 0x40)
+        mmio.write8(0x50, 0x88)
+    }
+    b.timer.delay_ms(50)
+    unsafe {
+        mmio.write8(0x50, 0)
+        mmio.write8(0x59, mmio.read8(0x59) & 0xBF)
+    }
+    ticks := TICKS.load(atomic.Ordering.SeqCst)!
+    checks.check(ticks >= 48 && ticks <= 52)
+}

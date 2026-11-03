@@ -1,0 +1,132 @@
+package main
+
+import "checks"
+import "core/mmio"
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/hal"
+
+// Digispark self-test, part four: std/embedded/chip/attiny85's pins,
+// EEPROM, analog inputs, PWM and watchdog (see core.dodo for how the result
+// is reported; buses.dodo tests the serial port, I2C and SPI). Nothing
+// needs to be wired to the board, and nothing touches P3 and P4, which
+// carry USB. The PWM checks sample their own pins, whose input buffer reads
+// the output.
+
+fn main() {
+    b := board.take()!
+    pin_checks(&mut b)
+    eeprom_checks(&mut b)
+    analog_checks(&mut b)
+    let board.Board { led: led, pins: parts, timer: timer, watchdog: dog, eeprom: eeprom } = b
+    pins := parts
+    watchdog := dog
+    pins.release(led)
+    pwm_checks(&mut pins)
+    watchdog_checks(&mut watchdog)
+    checks.finish()
+}
+
+@inline(never)
+fn pin_checks(b: &mut board.Board) {
+    input := b.pins.input_pull_up(board.P2)!
+    b.timer.delay_us(50)
+    pulled := input.is_high()
+    input.set_low()
+    input.set_as_output()
+    driven := !input.is_high()
+    b.pins.release(input)
+    checks.check(pulled && driven)
+    b.led.set_high()
+    lit := (unsafe {
+        mmio.read8(0x36)
+    } & 0x02) != 0
+    b.led.set_low()
+    checks.check(lit && !b.led.is_high())
+}
+
+@inline(never)
+fn eeprom_checks(b: &mut board.Board) {
+    // A value that changes every run, so the write is real.
+    old: [2]u8 = [0u8; 2]
+    b.eeprom.read(510, &mut old)!
+    next: [2]u8 = [((old[0] as u32 + 1) & 255) as u8, old[0] ^ 0xFF]
+    b.eeprom.update(510, &next)!
+    back: [2]u8 = [0u8; 2]
+    b.eeprom.read(510, &mut back)!
+    checks.check(back[0] == next[0] && back[1] == next[1])
+    checks.check(match b.eeprom.read(511, &mut back) {
+        ok() => false,
+        err(error) => error == hal.Error.InvalidInput,
+    })
+}
+
+@inline(never)
+fn analog_checks(b: &mut board.Board) {
+    sensor := b.pins.temperature()!
+    reading := sensor.read()!
+    celsius := chip.millicelsius(reading) / 1000
+    checks.check(reading > 200 && reading < 450 && celsius > -40 && celsius < 100)
+    input := b.pins.analog(board.P2)!
+    value := input.read()!
+    checks.check(value <= chip.ANALOG_MAX)
+    b.pins.release_analog(input)
+    checks.check(match b.pins.analog(board.P0) {
+        ok(_) => false,
+        err(error) => error == hal.Error.InvalidInput,
+    })
+}
+
+// The fraction of `samples` reads of PINB that find `bit` high, in 1/256.
+fn duty_of(bit: u8, samples: u16) -> u16 {
+    high := 0u32
+    for _ in 0u16..samples {
+        if (unsafe {
+            mmio.read8(0x36)
+        } & bit) != 0 {
+            high += 1
+        }
+    }
+    return ((high * 256 / samples as u32) & 0xFFFF) as u16
+}
+
+@inline(never)
+fn pwm_checks(pins: &mut chip.Pins) {
+    // Timer 1 on P1 at 4 kHz: a quarter, then always on.
+    output := pins.pwm(board.P1, 4000)!
+    max := output.max_duty()
+    output.set_duty(max / 4)!
+    quarter := duty_of(0x02, 4000)
+    output.set_duty(max)!
+    full := duty_of(0x02, 500)
+    output.set_duty(0)!
+    off := duty_of(0x02, 500)
+    checks.check(quarter > 50 && quarter < 78 && full == 256 && off == 0)
+    // P4 shares Timer 1, so another frequency is refused.
+    checks.check(match pins.pwm(board.P4, 1000) {
+        ok(_) => false,
+        err(error) => error == hal.Error.InvalidInput,
+    })
+    pins.release_pwm(output)
+    // Timer 0 on P0, at the time base's frequency: three quarters.
+    slow := pins.pwm(board.P0, 1000)!
+    slow.set_duty(192)!
+    three := duty_of(0x01, 4000)
+    pins.release_pwm(slow)
+    checks.check(three > 178 && three < 206)
+}
+
+@inline(never)
+fn watchdog_checks(watchdog: &mut chip.Watchdog) {
+    checks.check(match watchdog.start(8) {
+        ok() => false,
+        err(error) => error == hal.Error.InvalidInput,
+    })
+    watchdog.start(500)!
+    watchdog.feed()
+    watchdog.stop()
+    control := unsafe {
+        mmio.read8(0x41)
+    }
+    checks.check((control & 0x48) == 0)
+}

@@ -1,0 +1,157 @@
+; Helpers for AVR chips without the MUL instruction, such as the ATtiny85,
+; which also have little flash: multiplication, and 32-bit division, as
+; compact assembly after libgcc's for these chips.
+;
+; LLVM calls __mulqi3 and __mulhi3 for 8- and 16-bit products as well as
+; __mulsi3 for 32-bit ones. Each shifts and adds, and stops once either
+; factor runs out of set bits. They are assembly so that the IR optimizer
+; cannot turn a loop back into a multiplication, which would call the
+; helper itself. Ordinary AVR calling convention: factors in r24 and r22
+; (8-bit), r25:r24 and r23:r22 (16-bit) or r25-r22 and r21-r18 (32-bit),
+; the product in r24, r25:r24 or r25-r22. They change only call-clobbered
+; registers (r0, r18 to r27, r30, r31) and keep r1 zero.
+;
+; __udivmodsi4 and __divmodsi4 use the AVR builtin calling convention, as
+; avr_builtins.ll describes: dividend in r25-r22, divisor in r21-r18,
+; quotient in r21-r18 and remainder in r25-r22. They are a quarter of the
+; size of the IR division, which the 64-bit helpers still use.
+
+module asm ".section .text.__mulqi3, \22ax\22, @progbits"
+module asm ".weak __mulqi3"
+module asm "__mulqi3:"
+module asm "    clr r0"
+module asm "1:  sbrc r24, 0"
+module asm "    add r0, r22"
+module asm "    add r22, r22"
+module asm "    breq 2f"
+module asm "    lsr r24"
+module asm "    brne 1b"
+module asm "2:  mov r24, r0"
+module asm "    ret"
+
+module asm ".section .text.__mulhi3, \22ax\22, @progbits"
+module asm ".weak __mulhi3"
+module asm "__mulhi3:"
+module asm "    clr r20"
+module asm "    clr r21"
+module asm "1:  sbrs r24, 0"
+module asm "    rjmp 2f"
+module asm "    add r20, r22"
+module asm "    adc r21, r23"
+module asm "2:  add r22, r22"
+module asm "    adc r23, r23"
+module asm "    cp r22, r1"
+module asm "    cpc r23, r1"
+module asm "    breq 3f"
+module asm "    lsr r25"
+module asm "    ror r24"
+module asm "    sbiw r24, 0"
+module asm "    brne 1b"
+module asm "3:  movw r24, r20"
+module asm "    ret"
+
+module asm ".section .text.__mulsi3, \22ax\22, @progbits"
+module asm ".weak __mulsi3"
+module asm "__mulsi3:"
+module asm "    clr r26"
+module asm "    clr r27"
+module asm "    movw r30, r26"
+module asm "1:  sbrs r22, 0"
+module asm "    rjmp 2f"
+module asm "    add r26, r18"
+module asm "    adc r27, r19"
+module asm "    adc r30, r20"
+module asm "    adc r31, r21"
+module asm "2:  add r18, r18"
+module asm "    adc r19, r19"
+module asm "    adc r20, r20"
+module asm "    adc r21, r21"
+module asm "    lsr r25"
+module asm "    ror r24"
+module asm "    ror r23"
+module asm "    ror r22"
+module asm "    brne 1b"
+module asm "    sbiw r24, 0"
+module asm "    cpc r23, r1"
+module asm "    brne 1b"
+module asm "    movw r22, r26"
+module asm "    movw r24, r30"
+module asm "    ret"
+
+; Restoring division, one quotient bit per step: the remainder in r31,
+; r30, r27, r26 takes the dividend's bits from the top, and each step's
+; carry, the complement of the quotient bit, shifts into the dividend's
+; registers from the bottom. r1 counts the 33 steps and is zero again after
+; them.
+module asm ".section .text.__udivmodsi4, \22ax\22, @progbits"
+module asm ".weak __udivmodsi4"
+module asm "__udivmodsi4:"
+module asm "    ldi r26, 33"
+module asm "    mov r1, r26"
+module asm "    sub r26, r26"
+module asm "    sub r27, r27"
+module asm "    movw r30, r26"
+module asm "    rjmp 2f"
+module asm "1:  rol r26"
+module asm "    rol r27"
+module asm "    rol r30"
+module asm "    rol r31"
+module asm "    cp r26, r18"
+module asm "    cpc r27, r19"
+module asm "    cpc r30, r20"
+module asm "    cpc r31, r21"
+module asm "    brcs 2f"
+module asm "    sub r26, r18"
+module asm "    sbc r27, r19"
+module asm "    sbc r30, r20"
+module asm "    sbc r31, r21"
+module asm "2:  rol r22"
+module asm "    rol r23"
+module asm "    rol r24"
+module asm "    rol r25"
+module asm "    dec r1"
+module asm "    brne 1b"
+module asm "    com r22"
+module asm "    com r23"
+module asm "    com r24"
+module asm "    com r25"
+module asm "    movw r18, r22"
+module asm "    movw r20, r24"
+module asm "    movw r22, r26"
+module asm "    movw r24, r30"
+module asm "    ret"
+
+; Signed: divides the magnitudes; the quotient is negative if the signs
+; differ (kept in r0's top bit) and the remainder takes the dividend's sign
+; (kept in T).
+module asm ".section .text.__divmodsi4, \22ax\22, @progbits"
+module asm ".weak __divmodsi4"
+module asm "__divmodsi4:"
+module asm "    mov r0, r21"
+module asm "    bst r25, 7"
+module asm "    brtc 1f"
+module asm "    com r0"
+module asm "    rcall 3f"
+module asm "1:  sbrc r21, 7"
+module asm "    rcall 2f"
+module asm "    rcall __udivmodsi4"
+module asm "    sbrc r0, 7"
+module asm "    rcall 2f"
+module asm "    brtc 4f"
+module asm "    rjmp 3f"
+module asm "2:  com r21"
+module asm "    com r20"
+module asm "    com r19"
+module asm "    neg r18"
+module asm "    sbci r19, 0xff"
+module asm "    sbci r20, 0xff"
+module asm "    sbci r21, 0xff"
+module asm "    ret"
+module asm "3:  com r25"
+module asm "    com r24"
+module asm "    com r23"
+module asm "    neg r22"
+module asm "    sbci r23, 0xff"
+module asm "    sbci r24, 0xff"
+module asm "    sbci r25, 0xff"
+module asm "4:  ret"

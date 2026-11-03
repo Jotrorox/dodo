@@ -1,0 +1,1422 @@
+package attiny85
+
+import "core/mmio"
+import "std/embedded/hal"
+import "std/embedded/hal/serial"
+import "std/io"
+
+// Microchip ATtiny85: an 8-bit AVR at up to 20 MHz with 8 KiB of flash,
+// 512 bytes of SRAM and 512 bytes of EEPROM, in an 8-pin package, the chip
+// of the Digispark. Build with `chip = "attiny85"` for a board of your own,
+// or with a board such as `board = "digispark"`, whose package
+// (`std/embedded/board`) passes its clock to `take` and names its wiring.
+//
+// Its six I/O pins are port B, numbered 0 to 5 as PB0 to PB5 (the constants
+// PB0 to PB5); PB5 is the reset pin unless a fuse turns that off.
+//
+//     chip := attiny85.take(attiny85.Config { cpu_hz: 16_500_000 })!
+//     led := chip.pins.output(attiny85.PB1)!
+//     for {
+//         led.toggle()
+//         chip.timer.delay_ms(500)
+//     }
+//
+// What the chip offers through `take`:
+//
+//   pins       output, input, and input_pull_up pins; a transmit-only
+//              serial port on any pin with `uart`, as the chip has no UART;
+//              I2C on PB0 (SDA) and PB2 (SCL) with `i2c` and SPI on PB2
+//              (clock), PB1 (data out) and PB0 (data in) with `spi`, both
+//              through the USI; PWM outputs on PB0, PB1 and PB4 with `pwm`;
+//              and analog inputs on PB2 to PB5 and the temperature sensor
+//              with `analog` and `temperature`
+//   timer      microseconds since `take` from Timer 0, and busy-waiting
+//              delays
+//   watchdog   resets the chip unless fed in time
+//   eeprom     the 512-byte EEPROM, which keeps data without power: read
+//              and update bytes, or use it through the hal Flash protocol
+//
+// Timer 0 is the time base: `take` runs it at the clock divided by 64, in
+// fast PWM mode, and the runtime counts its overflows in the TIMER0_OVF
+// handler, as the Arduino core does. Its PWM output on PB0 runs at its
+// frequency (1007 Hz at 16.5 MHz). Programs may handle every other
+// interrupt with `@interrupt(NAME)`, NAME as in the datasheet's vector table
+// (INT0, PCINT0, TIMER1_COMPA, ADC, WDT, USI_OVF, ...).
+//
+// Memory is tiny: string constants and statics share the 512 bytes of SRAM
+// with the stack, and the linker refuses programs that leave the stack
+// less than 128 bytes. The compiler keeps panic messages in flash, and this
+// package's default panic report reads them from there.
+
+pub const PIN_COUNT: u32 = 6
+
+pub const PB0: u32 = 0
+pub const PB1: u32 = 1
+pub const PB2: u32 = 2
+pub const PB3: u32 = 3
+pub const PB4: u32 = 4
+pub const PB5: u32 = 5
+
+// The USI's pins, for I2C and SPI.
+pub const I2C_SDA_PIN: u32 = PB0
+pub const I2C_SCL_PIN: u32 = PB2
+pub const SPI_RX_PIN: u32 = PB0
+pub const SPI_TX_PIN: u32 = PB1
+pub const SPI_CLOCK_PIN: u32 = PB2
+
+// EEPROM size and the erase block of its hal Flash protocol.
+pub const EEPROM_BYTES: u32 = 512
+pub const EEPROM_BLOCK: u32 = 64
+
+// Analog readings are 10 bits.
+pub const ANALOG_MAX: u16 = 1023
+
+// The lowest and highest serial speeds `uart` takes.
+pub const UART_MIN_BAUD: u32 = 9600
+pub const UART_MAX_BAUD: u32 = 115_200
+
+// Register addresses in data space (I/O address + 0x20).
+const ADCL: usize = 0x24
+const ADCH: usize = 0x25
+const ADCSRA: usize = 0x26
+const ADMUX: usize = 0x27
+const USICR: usize = 0x2D
+const USISR: usize = 0x2E
+const USIDR: usize = 0x2F
+const DIDR0: usize = 0x34
+const PINB: usize = 0x36
+const DDRB: usize = 0x37
+const PORTB: usize = 0x38
+const EECR: usize = 0x3C
+const EEDR: usize = 0x3D
+const EEARL: usize = 0x3E
+const EEARH: usize = 0x3F
+const PRR: usize = 0x40
+const OCR0B: usize = 0x48
+const OCR0A: usize = 0x49
+const TCCR0A: usize = 0x4A
+const OCR1B: usize = 0x4B
+const GTCCR: usize = 0x4C
+const OCR1C: usize = 0x4D
+const OCR1A: usize = 0x4E
+const TCCR1: usize = 0x50
+const TCCR0B: usize = 0x53
+const TIMSK: usize = 0x59
+
+// ADCSRA and ADMUX.
+const ADEN: u8 = 0x80
+const ADSC: u8 = 0x40
+const ADC_DIVIDE_128: u8 = 0x07
+const REFERENCE_VCC: u8 = 0x00
+const REFERENCE_INTERNAL: u8 = 0x80
+const REFERENCE_BITS: u8 = 0xD0
+const TEMPERATURE_CHANNEL: u8 = 0x0F
+// Conversions discarded after the reference changes, about 1.6 ms at
+// 16.5 MHz, while the internal reference settles.
+const SETTLE_CONVERSIONS: u32 = 16
+
+// USICR and USISR.
+const USIWM1: u8 = 0x20
+const USIWM0: u8 = 0x10
+const USICS1: u8 = 0x08
+const USICS0: u8 = 0x04
+const USICLK: u8 = 0x02
+const USITC: u8 = 0x01
+const USISIF: u8 = 0x80
+const USIOIF: u8 = 0x40
+const USIPF: u8 = 0x20
+// USISR values that clear the flags and count 8 bits or 1 bit (16 or 2
+// clock edges).
+const USI_8_BITS: u8 = 0xF0
+const USI_1_BIT: u8 = 0xFE
+
+// PRR.
+const PRTIM1: u8 = 0x08
+const PRUSI: u8 = 0x02
+const PRADC: u8 = 0x01
+
+// Claims beyond the pins (bits 0 to 5).
+const CLAIM_USI: u16 = 1 << 8
+const CLAIM_TEMPERATURE: u16 = 1 << 9
+
+// Waits for a flag before an operation is reported as Timeout; a status poll
+// takes under a microsecond.
+const ATTEMPTS: u32 = 50_000
+
+static mut TAKEN: bool = false
+// Pins and peripherals handed out and not yet released.
+static mut CLAIMED: u16 = 0
+// Timer 1's PWM top and clock selection, shared by PB1 and PB4; its users.
+static mut TIMER1_TOP: u8 = 0
+static mut TIMER1_CLOCK: u8 = 0
+static mut TIMER1_USERS: u8 = 0
+// The clock, for the serial port, the buses and the delays.
+static mut CPU_HZ: u32 = 16_500_000
+// The open serial port's pin (its PORTB bit) and bit time, 0 while none is
+// open: panics are reported on it.
+static mut CONSOLE_BIT: u8 = 0
+static mut CONSOLE_LOOPS: u16 = 0
+static mut REPORTING: bool = false
+
+// Provided by the compiler's ATtiny85 runtime.
+unsafe extern "C" fn dodo_avr_micros() -> u64
+unsafe extern "C" fn dodo_avr_set_clock(overflow_us: u16, fraction: u8, tick_scale: u16)
+unsafe extern "C" fn dodo_avr_delay_loops32(count: u32)
+unsafe extern "C" fn dodo_avr_soft_tx(byte: u8, mask: u8, loops: u16)
+unsafe extern "C" fn dodo_avr_flash_byte(address: u16) -> u8
+unsafe extern "C" fn dodo_avr_reset_cause() -> u8
+unsafe extern "C" fn dodo_avr_eeprom_write(address: u16, value: u8, mode: u8)
+unsafe extern "C" fn dodo_avr_watchdog(config: u8)
+unsafe extern "C" fn dodo_avr_watchdog_feed()
+unsafe extern "C" fn dodo_avr_jump_to_zero()
+
+fn read(address: usize) -> u8 {
+    // SAFETY: every caller passes one of the register addresses above.
+    unsafe {
+        return mmio.read8(address)
+    }
+}
+
+fn write(address: usize, value: u8) {
+    // SAFETY: every caller passes one of the register addresses above, and
+    // owns the register or the bits it changes.
+    unsafe {
+        mmio.write8(address, value)
+    }
+}
+
+// Set and clear bits of a register that other owners share, with
+// interrupts masked so that a handler's change in between is not lost.
+fn modify(address: usize, clear: u8, set: u8) {
+    section := hal.Critical.enter()
+    write(address, (read(address) & ~clear) | set)
+    core.drop(section)
+}
+
+// A pin's bit in the port registers; pins are 0 to 5. An 8-bit shift
+// costs far less than a 32-bit one on this core.
+fn bit_of(number: u32) -> u8 {
+    return 1u8 << ((number & 7) as u8)
+}
+
+// Busy-wait `count` delay loops of 4 cycles; nothing for 0.
+fn delay_loops(count: u32) {
+    // SAFETY: only spends cycles.
+    unsafe {
+        dodo_avr_delay_loops32(count)
+    }
+}
+
+// Claim `mask` of the shared claims: Busy if any of it is out.
+fn claim(mask: u16) -> void!hal.Error {
+    section := hal.Critical.enter()
+    // SAFETY: interrupts are masked, so the claims change atomically.
+    busy := unsafe {
+        (CLAIMED & mask) != 0
+    }
+    if !busy {
+        unsafe {
+            CLAIMED |= mask
+        }
+    }
+    core.drop(section)
+    if busy {
+        return err(hal.Error.Busy)
+    }
+    return ok()
+}
+
+fn unclaim(mask: u16) {
+    section := hal.Critical.enter()
+    // SAFETY: interrupts are masked, so the claims change atomically.
+    unsafe {
+        CLAIMED &= ~mask
+    }
+    core.drop(section)
+}
+
+fn pin_mask(number: u32) -> u16!hal.Error {
+    if number >= PIN_COUNT {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(bit_of(number) as u16)
+}
+
+fn cpu_hz() -> u32 {
+    // SAFETY: written once, by take().
+    unsafe {
+        return CPU_HZ
+    }
+}
+
+// What the circuit board decides. Board packages pass theirs to `take`.
+pub struct Config {
+    // The CPU clock in hertz, 1 to 20 MHz: 16.5 MHz on the Digispark,
+    // whose bootloader tunes the internal oscillator to the computer's USB
+    // clock, 16 MHz from its PLL otherwise, 8 or 1 MHz from the internal
+    // oscillator as the chip ships.
+    pub cpu_hz: u32
+}
+
+// The chip's peripherals, from `take`.
+pub struct Peripherals {
+    pub pins: Pins
+    pub timer: Timer
+    pub watchdog: Watchdog
+    pub eeprom: Eeprom
+}
+
+// Start the time base and return the peripherals. A second call returns
+// Error.Busy, so no two owners exist; a clock outside 1 to 20 MHz returns
+// Error.InvalidInput. Inlined, so that a board's constant clock folds the
+// divisions below away.
+@inline
+pub fn take(config: Config) -> Peripherals!hal.Error {
+    cpu := config.cpu_hz
+    if cpu < 1_000_000 || cpu > 20_000_000 {
+        return err(hal.Error.InvalidInput)
+    }
+    section := hal.Critical.enter()
+    // SAFETY: interrupts are masked, so the flag is read and set atomically.
+    taken := unsafe {
+        TAKEN
+    }
+    unsafe {
+        TAKEN = true
+        CPU_HZ = cpu
+    }
+    core.drop(section)
+    if taken {
+        return err(hal.Error.Busy)
+    }
+    // The microseconds of a Timer 0 overflow (256 ticks of 64 cycles),
+    // whole and in 1/256 us: 992 + 248/256 at 16.5 MHz, exactly 1024 at
+    // 16 MHz. The same number is a tick's length in 1/256 us.
+    khz := cpu / 1000
+    whole := 16_384_000 / khz
+    fraction := (16_384_000 % khz) * 256 / khz
+    tick := whole
+    if fraction >= 128 {
+        tick += 1
+    }
+    // SAFETY: sets the runtime's step before its handler runs.
+    unsafe {
+        dodo_avr_set_clock((whole & 0xFFFF) as u16, (fraction & 255) as u8, (tick & 0xFFFF) as u16)
+    }
+    // Everything off but Timer 0, which counts time from here: fast PWM,
+    // the clock divided by 64, and its overflow interrupt.
+    write(PRR, PRTIM1 | PRUSI | PRADC)
+    write(TCCR0A, 0x03)
+    write(TCCR0B, 0x03)
+    write(TIMSK, 0x02)
+    return ok(Peripherals {
+        pins: Pins {},
+        timer: Timer {
+            loops_per_ms: cpu / 4000,
+            loops_per_us_16: cpu / 250_000,
+        },
+        watchdog: Watchdog { running: false },
+        eeprom: Eeprom {},
+    })
+}
+
+// Why the chip last started, from MCUSR at reset: bit 0 power-on, 1 the
+// reset pin, 2 brown-out, 3 the watchdog. Bootloaders that run first, such
+// as the Digispark's, may clear it.
+pub fn reset_flags() -> u8 {
+    // SAFETY: reads a byte the runtime saved at reset.
+    unsafe {
+        return dodo_avr_reset_cause()
+    }
+}
+
+// Restart the chip through the watchdog: it resets 16 ms later. Does not
+// return.
+pub fn restart() {
+    // SAFETY: the chip resets before anything else runs.
+    unsafe {
+        dodo_avr_watchdog(0x08)
+    }
+    for {}
+}
+
+// Stop the peripherals and interrupts, release every pin, and jump to
+// address 0 without a reset: into the bootloader, where one owns the reset
+// vector, as micronucleus on the Digispark does, otherwise to the start of
+// the program. Does not return.
+pub fn jump_to_start() {
+    // SAFETY: what runs at address 0 starts from scratch.
+    unsafe {
+        dodo_avr_jump_to_zero()
+    }
+}
+
+// One byte of program memory at `address`, such as a panic message.
+pub fn flash_byte(address: u16) -> u8 {
+    // SAFETY: LPM reads any flash address.
+    unsafe {
+        return dodo_avr_flash_byte(address)
+    }
+}
+
+// --- Pins -------------------------------------------------------------------
+
+// The GPIO pins and the peripherals on them. Each pin and peripheral is
+// handed out once until released; a second claim returns Error.Busy, and a
+// pin number from PIN_COUNT on returns Error.InvalidInput.
+pub struct Pins {
+    // A push-pull output, low until set. Claims the pin.
+    pub fn output(&mut self, number: u32) -> Pin!hal.Error {
+        mask := pin_mask(number)?
+        claim(mask)?
+        pin := Pin { number, bit: bit_of(number) }
+        pin.set_low()
+        pin.set_as_output()
+        return ok(pin)
+    }
+
+    // An input without pull-up, for a line another device drives.
+    pub fn input(&mut self, number: u32) -> Pin!hal.Error {
+        mask := pin_mask(number)?
+        claim(mask)?
+        pin := Pin { number, bit: bit_of(number) }
+        pin.set_as_input()
+        pin.set_pull_up(false)
+        return ok(pin)
+    }
+
+    // An input with the internal pull-up (20 to 50 kOhm), for a button to
+    // ground: high while released.
+    pub fn input_pull_up(&mut self, number: u32) -> Pin!hal.Error {
+        pin := self.input(number)?
+        pin.set_pull_up(true)
+        return ok(pin)
+    }
+
+    // Give back a pin: it becomes an input without pull-up.
+    pub fn release(&mut self, pin: Pin) {
+        pin.set_as_input()
+        pin.set_pull_up(false)
+        unclaim(bit_of(pin.number) as u16)
+    }
+
+    // A transmit-only serial port on `tx`, any pin, at `baud` (9600 to
+    // 115200), 8 data bits, no parity, 1 stop bit. The chip has no UART, so
+    // the runtime times each bit by counting cycles, with interrupts masked
+    // for the frame. `rx` must be none: InvalidInput otherwise, and for a
+    // baud rate outside the range or one the clock cannot make within 2 %.
+    pub fn uart(&mut self, tx: u32, rx: Option<u32>, baud: u32) -> Serial!hal.Error {
+        match rx {
+            some(_) => {
+                return err(hal.Error.InvalidInput)
+            }
+            none => {}
+        }
+        if baud < UART_MIN_BAUD || baud > UART_MAX_BAUD {
+            return err(hal.Error.InvalidInput)
+        }
+        // A bit takes 4 * loops + 13 cycles.
+        cycles := (cpu_hz() + baud / 2) / baud
+        if cycles < 17 {
+            return err(hal.Error.InvalidInput)
+        }
+        loops := (cycles - 13 + 2) / 4
+        actual := cpu_hz() / (4 * loops + 13)
+        difference := 0u32
+        if actual > baud {
+            difference = actual - baud
+        } else {
+            difference = baud - actual
+        }
+        if difference * 50 > baud || loops > 0xFFFF {
+            return err(hal.Error.InvalidInput)
+        }
+        mask := pin_mask(tx)?
+        claim(mask)?
+        bit := bit_of(tx)
+        // Idle high.
+        modify(PORTB, 0, bit)
+        modify(DDRB, 0, bit)
+        unsafe {
+            CONSOLE_BIT = bit
+            CONSOLE_LOOPS = (loops & 0xFFFF) as u16
+        }
+        return ok(Serial { baud: actual, pin: tx, bit, loops: (loops & 0xFFFF) as u16, crlf: false })
+    }
+
+    // Give back the port's pin.
+    pub fn release_uart(&mut self, port: Serial) {
+        unsafe {
+            CONSOLE_BIT = 0
+        }
+        modify(DDRB, port.bit, 0)
+        modify(PORTB, port.bit, 0)
+        unclaim(bit_of(port.pin) as u16)
+    }
+
+    // An I2C controller on the USI, with SDA on PB0 and SCL on PB2, at
+    // about `frequency_hz` (up to 400 kHz). The USI drives the lines low
+    // only, so they need pull-up resistors, as most modules have.
+    // InvalidInput for other pins or frequencies; Busy if the USI or a pin
+    // is out.
+    pub fn i2c(&mut self, sda: u32, scl: u32, frequency_hz: u32) -> I2c!hal.Error {
+        if sda != I2C_SDA_PIN || scl != I2C_SCL_PIN || frequency_hz == 0 || frequency_hz > 400_000 {
+            return err(hal.Error.InvalidInput)
+        }
+        claim(CLAIM_USI | (bit_of(sda) | bit_of(scl)) as u16)?
+        modify(PRR, PRUSI, 0)
+        // Both lines released (high through the pull-ups), then outputs.
+        modify(PORTB, 0, bit_of(sda) | bit_of(scl))
+        modify(DDRB, 0, bit_of(sda) | bit_of(scl))
+        write(USIDR, 0xFF)
+        write(USICR, USIWM1 | USICS1 | USICLK)
+        write(USISR, USISIF | USIOIF | USIPF | 0x10)
+        // A half period takes 4 * loops cycles and about 12 more.
+        cycles := cpu_hz() / (2 * frequency_hz)
+        loops := 0u32
+        if cycles > 12 {
+            loops = (cycles - 12 + 3) / 4
+        }
+        return ok(I2c { frequency_hz: cpu_hz() / (2 * (4 * loops + 12)), loops })
+    }
+
+    // Give back the controller and its pins.
+    pub fn release_i2c(&mut self, bus: I2c) {
+        write(USICR, 0)
+        modify(DDRB, bit_of(I2C_SDA_PIN) | bit_of(I2C_SCL_PIN), 0)
+        modify(PORTB, bit_of(I2C_SDA_PIN) | bit_of(I2C_SCL_PIN), 0)
+        modify(PRR, 0, PRUSI)
+        unclaim(CLAIM_USI | (bit_of(I2C_SDA_PIN) | bit_of(I2C_SCL_PIN)) as u16)
+    }
+
+    // An SPI controller on the USI: clock on PB2, data out on PB1, data in
+    // on PB0 (or none, leaving PB0 free), most significant bit first, at
+    // about `frequency_hz`, which the program's own clocking limits to a
+    // few hundred kHz. Use any output pin as chip select. InvalidInput for other
+    // pins or a frequency of 0; Busy if the USI or a pin is out.
+    pub fn spi(&mut self, clock: u32, tx: u32, rx: Option<u32>, mode: hal.SpiMode, frequency_hz: u32) -> Spi!hal.Error {
+        mask := bit_of(SPI_CLOCK_PIN) | bit_of(SPI_TX_PIN)
+        match rx {
+            some(pin) => {
+                if pin != SPI_RX_PIN {
+                    return err(hal.Error.InvalidInput)
+                }
+                mask |= bit_of(pin)
+            }
+            none => {}
+        }
+        if clock != SPI_CLOCK_PIN || tx != SPI_TX_PIN || frequency_hz == 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        claim(CLAIM_USI | mask as u16)?
+        modify(PRR, PRUSI, 0)
+        // Modes 0 and 3 sample on the rising edge, 1 and 2 on the falling
+        // one; 2 and 3 idle with the clock high.
+        control := USIWM0 | USICS1 | USICLK
+        idle_high := false
+        match mode {
+            hal.SpiMode.Mode0 => {}
+            hal.SpiMode.Mode1 => {
+                control |= USICS0
+            }
+            hal.SpiMode.Mode2 => {
+                control |= USICS0
+                idle_high = true
+            }
+            hal.SpiMode.Mode3 => {
+                idle_high = true
+            }
+        }
+        if idle_high {
+            modify(PORTB, 0, bit_of(SPI_CLOCK_PIN))
+        } else {
+            modify(PORTB, bit_of(SPI_CLOCK_PIN), 0)
+        }
+        modify(DDRB, 0, bit_of(SPI_CLOCK_PIN) | bit_of(SPI_TX_PIN))
+        if (mask & bit_of(SPI_RX_PIN)) != 0 {
+            modify(DDRB, bit_of(SPI_RX_PIN), 0)
+        }
+        write(USICR, control)
+        // An edge takes 4 * loops cycles and about 6 more.
+        cycles := cpu_hz() / (2 * frequency_hz)
+        loops := 0u32
+        if cycles > 6 {
+            loops = (cycles - 6 + 3) / 4
+        }
+        return ok(Spi {
+            frequency_hz: cpu_hz() / (2 * (4 * loops + 6)),
+            control,
+            loops,
+            mask,
+        })
+    }
+
+    // Give back the controller and its pins.
+    pub fn release_spi(&mut self, bus: Spi) {
+        write(USICR, 0)
+        modify(DDRB, bit_of(SPI_CLOCK_PIN) | bit_of(SPI_TX_PIN), 0)
+        modify(PORTB, bit_of(SPI_CLOCK_PIN) | bit_of(SPI_TX_PIN), 0)
+        modify(PRR, 0, PRUSI)
+        unclaim(CLAIM_USI | bus.mask as u16)
+    }
+
+    // A PWM output. PB1 and PB4 share Timer 1, which takes `frequency_hz`
+    // from the first of them (4 Hz up at 16.5 MHz, with less resolution as
+    // it rises: max_duty() is the count per period, up to 255); the second
+    // must ask for the same frequency. PB0 runs on the time
+    // base's Timer 0, at its 1007 Hz (at 16.5 MHz) whatever `frequency_hz`
+    // is, with max_duty() 255. InvalidInput for another pin, a frequency of
+    // 0, or one Timer 1 cannot make.
+    pub fn pwm(&mut self, pin: u32, frequency_hz: u32) -> Pwm!hal.Error {
+        if frequency_hz == 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        if pin == PB0 {
+            claim(bit_of(pin) as u16)?
+            output := Pwm { pin, max: 255 }
+            output.start()
+            return ok(output)
+        }
+        if pin != PB1 && pin != PB4 {
+            return err(hal.Error.InvalidInput)
+        }
+        // The smallest of the prescalers 1, 2, 4, ... 16384 whose period
+        // fits 255 counts.
+        cpu := cpu_hz()
+        selection := 0u8
+        ticks := 0u32
+        for index in 0u32..15 {
+            count := (cpu >> index) / frequency_hz
+            if count <= 255 {
+                if count >= 2 {
+                    selection = (index + 1) as u8
+                    ticks = count
+                }
+                break
+            }
+        }
+        if selection == 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        section := hal.Critical.enter()
+        users := unsafe {
+            TIMER1_USERS
+        }
+        same := unsafe {
+            TIMER1_CLOCK == selection && TIMER1_TOP as u32 == ticks - 1
+        }
+        core.drop(section)
+        if users != 0 && !same {
+            return err(hal.Error.InvalidInput)
+        }
+        claim(bit_of(pin) as u16)?
+        if users == 0 {
+            modify(PRR, PRTIM1, 0)
+            write(OCR1C, ((ticks - 1) & 255) as u8)
+            modify(TCCR1, 0x8F, selection)
+        }
+        unsafe {
+            TIMER1_TOP = ((ticks - 1) & 255) as u8
+            TIMER1_CLOCK = selection
+            TIMER1_USERS = users + 1
+        }
+        output := Pwm { pin, max: (ticks & 0xFFFF) as u16 }
+        output.start()
+        return ok(output)
+    }
+
+    pub fn release_pwm(&mut self, output: Pwm) {
+        output.stop()
+        if output.pin != PB0 {
+            users := unsafe {
+                TIMER1_USERS
+            }
+            if users == 1 {
+                write(TCCR1, 0)
+                modify(PRR, 0, PRTIM1)
+            }
+            unsafe {
+                TIMER1_USERS = users - 1
+            }
+        }
+        unclaim(bit_of(output.pin) as u16)
+    }
+
+    // An analog input on PB2 (ADC1), PB3 (ADC3), PB4 (ADC2) or PB5 (ADC0):
+    // 0 at ground to ANALOG_MAX at the supply voltage. Disables the pin's
+    // digital input buffer, which saves power. InvalidInput for another pin.
+    pub fn analog(&mut self, pin: u32) -> Analog!hal.Error {
+        if pin < PB2 || pin > PB5 {
+            return err(hal.Error.InvalidInput)
+        }
+        claim(bit_of(pin) as u16)?
+        // PB2 to PB5 are channels 1, 3, 2 and 0, two bits each here.
+        channel := ((0x2Du32 >> (2 * (pin - PB2))) & 3) as u8
+        modify(DIDR0, 0, bit_of(pin))
+        start_converter()
+        return ok(Analog { channel, reference: REFERENCE_VCC, pin })
+    }
+
+    // The temperature sensor, an analog input against the internal 1.1 V
+    // reference: about 300 at 25 C, rising about 1.08 per degree;
+    // `millicelsius` converts a reading. Busy if it is out already.
+    pub fn temperature(&mut self) -> Analog!hal.Error {
+        claim(CLAIM_TEMPERATURE)?
+        start_converter()
+        return ok(Analog { channel: TEMPERATURE_CHANNEL, reference: REFERENCE_INTERNAL, pin: PIN_COUNT })
+    }
+
+    pub fn release_analog(&mut self, input: Analog) {
+        if input.pin < PIN_COUNT {
+            modify(DIDR0, bit_of(input.pin), 0)
+            unclaim(bit_of(input.pin) as u16)
+        } else {
+            unclaim(CLAIM_TEMPERATURE)
+        }
+    }
+}
+
+// One GPIO pin, from Pins.output or Pins.input. Implements the hal
+// OutputPin and InputPin protocols.
+pub struct Pin: hal.OutputPin + hal.InputPin {
+    number: u32
+    bit: u8
+
+    pub fn set_high(&mut self) {
+        modify(PORTB, 0, self.bit)
+    }
+
+    pub fn set_low(&mut self) {
+        modify(PORTB, self.bit, 0)
+    }
+
+    // Writing a one to PINB toggles the output in one step.
+    pub fn toggle(&mut self) {
+        write(PINB, self.bit)
+    }
+
+    pub fn is_high(&self) -> bool {
+        return (read(PINB) & self.bit) != 0
+    }
+
+    // Drive the pin at its output level, for a line that changes direction.
+    pub fn set_as_output(&mut self) {
+        modify(DDRB, 0, self.bit)
+    }
+
+    // Stop driving the pin; is_high reads it.
+    pub fn set_as_input(&mut self) {
+        modify(DDRB, self.bit, 0)
+    }
+
+    // The internal pull-up of an input pin (the PORTB bit while it is an
+    // input).
+    pub fn set_pull_up(&mut self, on: bool) {
+        if on {
+            self.set_high()
+        } else {
+            self.set_low()
+        }
+    }
+
+    // The pin's number, as given to Pins.
+    pub fn number(&self) -> u32 {
+        return self.number
+    }
+}
+
+// --- Time -------------------------------------------------------------------
+
+// Microseconds since `take`, from Timer 0, which ticks every 64 cycles
+// (3.88 us at 16.5 MHz), and busy-waiting delays. The runtime adds up the
+// microseconds of each overflow of the timer, so reading the time takes no
+// 64-bit arithmetic. Implements the hal Delay
+// and Counter protocols.
+pub struct Timer: hal.Delay + hal.Counter {
+    // Delay loops (4 cycles each) per millisecond, and per microsecond in
+    // 1/16ths.
+    loops_per_ms: u32
+    loops_per_us_16: u32
+
+    // Microseconds since take(), in steps of 64 cycles.
+    pub fn now_us(&self) -> u64 {
+        // SAFETY: reads the runtime's count with interrupts masked.
+        unsafe {
+            return dodo_avr_micros()
+        }
+    }
+
+    // Busy-wait `microseconds`, counting cycles, so it also works with
+    // interrupts masked; interrupt handlers that run meanwhile lengthen it,
+    // and a call takes a few microseconds of its own.
+    pub fn delay_us(&mut self, microseconds: u32) {
+        left := microseconds
+        for left > 0 {
+            chunk := left
+            if chunk > 10_000 {
+                chunk = 10_000
+            }
+            delay_loops((chunk * self.loops_per_us_16) >> 4)
+            left -= chunk
+        }
+    }
+
+    pub fn delay_ms(&mut self, milliseconds: u32) {
+        for _ in 0..milliseconds {
+            delay_loops(self.loops_per_ms)
+        }
+    }
+}
+
+// --- Serial port ------------------------------------------------------------
+
+// A transmit-only serial port, from Pins.uart. Implements std/io's Writer
+// and the serial Port and PollPort protocols, so std/fmt writes to it;
+// reading reports io.ErrorKind.InvalidInput. Each byte goes out before
+// write returns, so flush has nothing to wait for.
+pub struct Serial: serial.Port + serial.PollPort {
+    // The rate the clock makes, within 2 % of the one asked for.
+    baud: u32
+    pin: u32
+    bit: u8
+    loops: u16
+    crlf: bool
+
+    pub fn baud(&self) -> u32 {
+        return self.baud
+    }
+
+    // Send each "\n" as "\r\n", as terminals expect.
+    pub fn set_crlf(&mut self, on: bool) {
+        self.crlf = on
+    }
+
+    fn send(&mut self, byte: u8) {
+        // SAFETY: the pin is this port's output.
+        unsafe {
+            dodo_avr_soft_tx(byte, self.bit, self.loops)
+        }
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) -> usize!io.Error {
+        for index in 0..bytes.len {
+            if self.crlf && bytes[index] == 10 {
+                self.send(13)
+            }
+            self.send(bytes[index])
+        }
+        return ok(bytes.len)
+    }
+
+    // Send one byte, which never has to wait for room.
+    pub fn poll_write(&mut self, bytes: &[u8]) -> io.Poll!io.Error {
+        if bytes.len == 0 {
+            return ok(io.Poll { transferred: 0, state: io.PollState.Ready })
+        }
+        if self.crlf && bytes[0] == 10 {
+            self.send(13)
+        }
+        self.send(bytes[0])
+        state := io.PollState.Ready
+        if bytes.len > 1 {
+            state = io.PollState.Pending
+        }
+        return ok(io.Poll { transferred: 1, state })
+    }
+
+    pub fn flush(&mut self) -> void!io.Error {
+        return ok()
+    }
+
+    pub fn poll_flush(&mut self) -> bool!io.Error {
+        return ok(true)
+    }
+
+    pub fn read(&mut self, buffer: &mut[u8]) -> usize!io.Error {
+        return err(io.failure(io.ErrorKind.InvalidInput, 0))
+    }
+
+    pub fn poll_read(&mut self, buffer: &mut[u8]) -> io.Poll!io.Error {
+        return err(io.failure(io.ErrorKind.InvalidInput, 0))
+    }
+}
+
+// --- I2C --------------------------------------------------------------------
+
+// An I2C controller on the USI, from Pins.i2c, after Atmel's application
+// note AVR310: the program clocks each bit, and waits while a target holds
+// SCL low. Implements hal.I2c.
+pub struct I2c: hal.I2c {
+    frequency_hz: u32
+    // Delay loops per half period.
+    loops: u32
+
+    // The SCL frequency the delays give, roughly.
+    pub fn frequency_hz(&self) -> u32 {
+        return self.frequency_hz
+    }
+
+    // Wait while SCL is held low; Timeout after ATTEMPTS polls.
+    fn wait_scl(&mut self) -> void!hal.Error {
+        for _ in 0..ATTEMPTS {
+            if (read(PINB) & bit_of(I2C_SCL_PIN)) != 0 {
+                return ok()
+            }
+        }
+        return err(hal.Error.Timeout)
+    }
+
+    // Clock out (and in) the bits USISR counts, then release SDA; returns
+    // what USIDR holds.
+    fn transfer(&mut self, count: u8) -> u8!hal.Error {
+        write(USISR, count)
+        strobe := USIWM1 | USICS1 | USICLK | USITC
+        for {
+            delay_loops(self.loops)
+            // Rising edge, then wait for a target that stretches it.
+            write(USICR, strobe)
+            self.wait_scl()?
+            delay_loops(self.loops)
+            write(USICR, strobe)
+            if (read(USISR) & USIOIF) != 0 {
+                break
+            }
+        }
+        delay_loops(self.loops)
+        value := read(USIDR)
+        write(USIDR, 0xFF)
+        modify(DDRB, 0, bit_of(I2C_SDA_PIN))
+        return ok(value)
+    }
+
+    fn start(&mut self) -> void!hal.Error {
+        modify(PORTB, 0, bit_of(I2C_SCL_PIN))
+        self.wait_scl()?
+        delay_loops(self.loops)
+        modify(PORTB, bit_of(I2C_SDA_PIN), 0)
+        delay_loops(self.loops)
+        modify(PORTB, bit_of(I2C_SCL_PIN), 0)
+        modify(PORTB, 0, bit_of(I2C_SDA_PIN))
+        return ok()
+    }
+
+    fn stop(&mut self) {
+        modify(PORTB, bit_of(I2C_SDA_PIN), 0)
+        modify(PORTB, 0, bit_of(I2C_SCL_PIN))
+        for _ in 0..ATTEMPTS {
+            if (read(PINB) & bit_of(I2C_SCL_PIN)) != 0 {
+                break
+            }
+        }
+        delay_loops(self.loops)
+        modify(PORTB, 0, bit_of(I2C_SDA_PIN))
+        delay_loops(self.loops)
+    }
+
+    // Send a byte; NoAcknowledge (after a stop) if the target does not
+    // acknowledge it.
+    fn send(&mut self, byte: u8) -> void!hal.Error {
+        modify(PORTB, bit_of(I2C_SCL_PIN), 0)
+        write(USIDR, byte)
+        self.transfer(USI_8_BITS)?
+        modify(DDRB, bit_of(I2C_SDA_PIN), 0)
+        acknowledge := self.transfer(USI_1_BIT)?
+        if (acknowledge & 1) != 0 {
+            self.stop()
+            return err(hal.Error.NoAcknowledge)
+        }
+        return ok()
+    }
+
+    fn address(&mut self, address: u8, reading: bool) -> void!hal.Error {
+        if address > 127 {
+            return err(hal.Error.InvalidInput)
+        }
+        self.start()?
+        byte := address << 1
+        if reading {
+            byte |= 1
+        }
+        return self.send(byte)
+    }
+
+    fn transmit(&mut self, bytes: &[u8]) -> void!hal.Error {
+        for index in 0..bytes.len {
+            self.send(bytes[index])?
+        }
+        return ok()
+    }
+
+    fn receive(&mut self, buffer: &mut[u8]) -> void!hal.Error {
+        for index in 0..buffer.len {
+            modify(DDRB, bit_of(I2C_SDA_PIN), 0)
+            buffer[index] = self.transfer(USI_8_BITS)?
+            // Acknowledge every byte but the last.
+            if index + 1 < buffer.len {
+                write(USIDR, 0x00)
+            } else {
+                write(USIDR, 0xFF)
+            }
+            self.transfer(USI_1_BIT)?
+        }
+        return ok()
+    }
+
+    pub fn write(&mut self, address: u8, bytes: &[u8]) -> void!hal.Error {
+        self.address(address, false)?
+        self.transmit(bytes)?
+        self.stop()
+        return ok()
+    }
+
+    pub fn read(&mut self, address: u8, buffer: &mut[u8]) -> void!hal.Error {
+        self.address(address, true)?
+        self.receive(buffer)?
+        self.stop()
+        return ok()
+    }
+
+    pub fn write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error {
+        self.address(address, false)?
+        self.transmit(bytes)?
+        self.address(address, true)?
+        self.receive(buffer)?
+        self.stop()
+        return ok()
+    }
+}
+
+// --- SPI --------------------------------------------------------------------
+
+// An SPI controller on the USI, from Pins.spi: the program clocks each
+// edge. Implements hal.Spi.
+pub struct Spi: hal.Spi {
+    frequency_hz: u32
+    control: u8
+    // Delay loops per clock edge.
+    loops: u32
+    // The pins it holds.
+    mask: u8
+
+    // The clock frequency the delays give, roughly.
+    pub fn frequency_hz(&self) -> u32 {
+        return self.frequency_hz
+    }
+
+    fn exchange(&mut self, byte: u8) -> u8 {
+        write(USIDR, byte)
+        write(USISR, USIOIF)
+        strobe := self.control | USITC
+        for (read(USISR) & USIOIF) == 0 {
+            write(USICR, strobe)
+            delay_loops(self.loops)
+        }
+        return read(USIDR)
+    }
+
+    pub fn transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error {
+        for index in 0..bytes.len {
+            bytes[index] = self.exchange(bytes[index])
+        }
+        return ok()
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) -> void!hal.Error {
+        for index in 0..bytes.len {
+            self.exchange(bytes[index])
+        }
+        return ok()
+    }
+}
+
+// --- PWM --------------------------------------------------------------------
+
+fn start_converter() {
+    modify(PRR, PRADC, 0)
+    write(ADCSRA, ADEN | ADC_DIVIDE_128)
+}
+
+// A PWM output, from Pins.pwm. Implements hal.PwmOutput.
+pub struct Pwm: hal.PwmOutput {
+    pin: u32
+    max: u16
+
+    // The pin as an output, low, with the compare output disconnected:
+    // duty 0.
+    fn start(&mut self) {
+        modify(PORTB, bit_of(self.pin), 0)
+        modify(DDRB, 0, bit_of(self.pin))
+    }
+
+    // Disconnect the compare output and make the pin an input.
+    fn stop(&mut self) {
+        self.connect(false)
+        modify(DDRB, bit_of(self.pin), 0)
+    }
+
+    // The pin's compare output: COM0A1 in TCCR0A for PB0, PWM1A and COM1A1
+    // in TCCR1 for PB1, PWM1B and COM1B1 in GTCCR for PB4.
+    fn connect(&mut self, on: bool) {
+        control := GTCCR
+        bits := 0x60u8
+        if self.pin == PB0 {
+            control = TCCR0A
+            bits = 0x80
+        } else if self.pin == PB1 {
+            control = TCCR1
+        }
+        if on {
+            modify(control, 0, bits)
+        } else {
+            modify(control, bits, 0)
+        }
+    }
+
+    pub fn max_duty(&self) -> u16 {
+        return self.max
+    }
+
+    // High for `duty` of every max_duty() counts; 0 disconnects the output,
+    // which holds the pin low.
+    pub fn set_duty(&mut self, duty: u16) -> void!hal.Error {
+        if duty > self.max {
+            return err(hal.Error.InvalidInput)
+        }
+        if duty == 0 {
+            self.connect(false)
+            return ok()
+        }
+        if self.pin == PB0 {
+            // Fast PWM to 255 is high for the compare value + 1 counts.
+            write(OCR0A, ((duty - 1) & 255) as u8)
+        } else {
+            // Timer 1 sets the output at 0 and clears it at the compare
+            // value; one above the top never matches, which holds it high.
+            value := (duty & 255) as u8
+            if duty > 255 {
+                value = 255
+            }
+            if self.pin == PB1 {
+                write(OCR1A, value)
+            } else {
+                write(OCR1B, value)
+            }
+        }
+        self.connect(true)
+        return ok()
+    }
+
+    pub fn pin(&self) -> u32 {
+        return self.pin
+    }
+}
+
+// --- Analog -----------------------------------------------------------------
+
+// An analog input, from Pins.analog or Pins.temperature. Implements
+// hal.AnalogInput. A conversion takes 13 converter clocks, 101 us at
+// 16.5 MHz.
+pub struct Analog: hal.AnalogInput {
+    channel: u8
+    reference: u8
+    // PIN_COUNT for the temperature sensor.
+    pin: u32
+
+    pub fn max_value(&self) -> u16 {
+        return ANALOG_MAX
+    }
+
+    // Convert once. After a switch to another reference, the first
+    // conversions are discarded while it settles.
+    pub fn read(&mut self) -> u16!hal.Error {
+        selection := self.reference | self.channel
+        if (read(ADMUX) & REFERENCE_BITS) != self.reference {
+            write(ADMUX, selection)
+            for _ in 0..SETTLE_CONVERSIONS {
+                self.convert()?
+            }
+        }
+        section := hal.Critical.enter()
+        write(ADMUX, selection)
+        result := self.convert()
+        core.drop(section)
+        return result
+    }
+
+    fn convert(&mut self) -> u16!hal.Error {
+        modify(ADCSRA, 0, ADSC)
+        for _ in 0..ATTEMPTS {
+            if (read(ADCSRA) & ADSC) == 0 {
+                low := read(ADCL)
+                high := read(ADCH)
+                return ok(((high as u16) << 8) | low as u16)
+            }
+        }
+        return err(hal.Error.Timeout)
+    }
+
+    pub fn pin(&self) -> u32 {
+        return self.pin
+    }
+}
+
+// The temperature in thousandths of a degree Celsius that a reading of the
+// temperature sensor shows, from the datasheet's typical values (230 at
+// -40 C, 300 at 25 C, 370 at 85 C). Chips differ by up to about 10
+// degrees; calibrate with an offset of your own where that matters.
+pub fn millicelsius(value: u16) -> i32 {
+    return (value as i32 - 300) * 6500 / 7 + 25_000
+}
+
+// --- Watchdog ---------------------------------------------------------------
+
+// The watchdog: stopped until `start`, it then resets the chip unless `feed`
+// is called within the timeout. Implements hal.Watchdog.
+pub struct Watchdog: hal.Watchdog {
+    running: bool
+
+    // The longest timeout, 8 s.
+    pub fn max_timeout_ms(&self) -> u32 {
+        return 8000
+    }
+
+    // Start (or restart) with the longest of the watchdog's timeouts, 16,
+    // 32 or 64 ms, 0.125 to 8 s in powers of two, that does not exceed
+    // `timeout_ms`. InvalidInput below 16 ms or above max_timeout_ms().
+    pub fn start(&mut self, timeout_ms: u32) -> void!hal.Error {
+        if timeout_ms < 16 || timeout_ms > 8000 {
+            return err(hal.Error.InvalidInput)
+        }
+        // The periods: 16, 32 and 64 ms, then 125 ms to 8 s. Computed
+        // rather than tabled, as a table would sit in SRAM.
+        selection := 0u8
+        for index in 1u32..10 {
+            period := 16u32 << index
+            if index >= 3 {
+                period = 125u32 << (index - 3)
+            }
+            if period <= timeout_ms {
+                selection = (index & 15) as u8
+            }
+        }
+        // WDE is bit 3, WDP3 bit 5 and WDP2:0 bits 2:0.
+        config := 0x08u8 | (selection & 7)
+        if selection >= 8 {
+            config |= 0x20
+        }
+        // SAFETY: the runtime runs the timed sequence.
+        unsafe {
+            dodo_avr_watchdog(config)
+        }
+        self.running = true
+        return ok()
+    }
+
+    pub fn feed(&mut self) {
+        // SAFETY: WDR only restarts the count.
+        unsafe {
+            dodo_avr_watchdog_feed()
+        }
+    }
+
+    pub fn stop(&mut self) {
+        // SAFETY: the runtime runs the timed sequence.
+        unsafe {
+            dodo_avr_watchdog(0)
+        }
+        self.running = false
+    }
+
+    // Whether the watchdog reset the chip last time, from the reset flags.
+    pub fn reset_reason(&self) -> hal.ResetReason {
+        if (reset_flags() & 0x08) != 0 {
+            return hal.ResetReason.Timeout
+        }
+        return hal.ResetReason.Other
+    }
+}
+
+// --- EEPROM -----------------------------------------------------------------
+
+// The 512-byte EEPROM, which keeps its bytes without power for about
+// 100,000 writes each. `read` and `update` are the usual way to keep
+// settings:
+//
+//     saved: [4]u8 = [0u8; 4]
+//     b.eeprom.read(0, &mut saved)!
+//     b.eeprom.update(0, &saved)!
+//
+// It also implements hal.Flash, with EEPROM_BLOCK-byte erase blocks and
+// single-byte writes, for drivers written against that protocol. A byte
+// takes 3.4 ms to erase and write, 1.8 ms for each alone. Flashing through
+// the Digispark's bootloader leaves the EEPROM as it was.
+pub struct Eeprom: hal.Flash {
+    pub fn capacity(&self) -> u32 {
+        return EEPROM_BYTES
+    }
+
+    pub fn erase_size(&self) -> u32 {
+        return EEPROM_BLOCK
+    }
+
+    pub fn write_size(&self) -> u32 {
+        return 1
+    }
+
+    fn check(&self, offset: u32, length: u32) -> void!hal.Error {
+        if offset > EEPROM_BYTES || length > EEPROM_BYTES - offset {
+            return err(hal.Error.InvalidInput)
+        }
+        return ok()
+    }
+
+    fn read_byte(&mut self, address: u32) -> u8 {
+        for (read(EECR) & 0x02) != 0 {}
+        write(EEARH, ((address >> 8) & 1) as u8)
+        write(EEARL, (address & 255) as u8)
+        write(EECR, 0x01)
+        return read(EEDR)
+    }
+
+    fn write_byte(&mut self, address: u32, value: u8, mode: u8) {
+        // SAFETY: an address checked to be inside the EEPROM.
+        unsafe {
+            dodo_avr_eeprom_write((address & 0x1FF) as u16, value, mode)
+        }
+    }
+
+    pub fn read(&mut self, offset: u32, buffer: &mut[u8]) -> void!hal.Error {
+        self.check(offset, buffer.len as u32)?
+        for index in 0..buffer.len {
+            buffer[index] = self.read_byte(offset + index as u32)
+        }
+        return ok()
+    }
+
+    // Set the range to 0xFF, skipping bytes that already are.
+    pub fn erase(&mut self, offset: u32, length: u32) -> void!hal.Error {
+        self.check(offset, length)?
+        if offset % EEPROM_BLOCK != 0 || length % EEPROM_BLOCK != 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        for address in offset..offset + length {
+            if self.read_byte(address) != 0xFF {
+                self.write_byte(address, 0xFF, 0x10)
+            }
+        }
+        return ok()
+    }
+
+    // Program `bytes`, which clears bits only, as the Flash protocol
+    // writes to erased bytes.
+    pub fn write(&mut self, offset: u32, bytes: &[u8]) -> void!hal.Error {
+        self.check(offset, bytes.len as u32)?
+        for index in 0..bytes.len {
+            address := offset + index as u32
+            if self.read_byte(address) != bytes[index] {
+                self.write_byte(address, bytes[index], 0x20)
+            }
+        }
+        return ok()
+    }
+
+    // Replace the bytes at `offset` with `bytes`, whatever they held,
+    // erasing and writing only the bytes that change: the usual way to keep
+    // a setting.
+    pub fn update(&mut self, offset: u32, bytes: &[u8]) -> void!hal.Error {
+        self.check(offset, bytes.len as u32)?
+        for index in 0..bytes.len {
+            address := offset + index as u32
+            if self.read_byte(address) != bytes[index] {
+                self.write_byte(address, bytes[index], 0x00)
+            }
+        }
+        return ok()
+    }
+}
+
+// --- Panics -----------------------------------------------------------------
+
+// The runtime's default panic hook, dodo_board_panic, calls this weak symbol,
+// if a program defines it, before it halts. Every program that uses this
+// package defines it; it writes nothing unless the serial port is open.
+extern "C" fn dodo_panic_report(check: *const u8, file: *const u8, line: u32, column: u32) {
+    // SAFETY: the compiler passes NUL-terminated strings in program memory,
+    // and the hook halts afterwards.
+    unsafe {
+        report_panic(check, file, line, column)
+    }
+}
+
+// Write a failed check, as the compiler passes it to the panic hook, to the
+// serial port if it is open:
+//
+//     dodo: arithmetic overflow check failed at /home/me/blink/main.dodo:12:5
+//
+// the line a desktop program prints. Only the first call reports.
+// SAFETY: `check` and `file` must be the hook's NUL-terminated strings, which
+// the compiler places in program memory, and the caller must halt or reset
+// afterwards, as this takes over the serial port.
+pub unsafe fn report_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
+    // The strings' addresses in program memory.
+    check_address := unsafe {
+        check as usize
+    }
+    file_address := unsafe {
+        file as usize
+    }
+    unsafe {
+        if REPORTING || CONSOLE_BIT == 0 {
+            return
+        }
+        REPORTING = true
+    }
+    send_text_bytes(b"\r\ndodo: ")
+    send_flash_text(check_address)
+    send_text_bytes(b" check failed at ")
+    send_flash_text(file_address)
+    send_text_bytes(b":")
+    send_number(line)
+    send_text_bytes(b":")
+    send_number(column)
+    send_text_bytes(b"\r\n")
+}
+
+fn send_raw(byte: u8) {
+    // SAFETY: the console's pin is an output while CONSOLE_BIT is set.
+    unsafe {
+        dodo_avr_soft_tx(byte, CONSOLE_BIT, CONSOLE_LOOPS)
+    }
+}
+
+fn send_text_bytes(text: &[u8]) {
+    for index in 0..text.len {
+        send_raw(text[index])
+    }
+}
+
+// Send a NUL-terminated string in program memory, up to 256 bytes.
+fn send_flash_text(address: usize) {
+    for index in 0usize..256 {
+        byte := flash_byte(((address + index) & 0xFFFF) as u16)
+        if byte == 0 {
+            return
+        }
+        send_raw(byte)
+    }
+}
+
+fn send_number(value: u32) {
+    digits: [10]u8 = [0; 10]
+    position := 10usize
+    rest := value
+    for {
+        position -= 1
+        digits[position] = (48 + rest % 10) as u8
+        rest = rest / 10
+        if rest == 0 {
+            break
+        }
+    }
+    send_text_bytes(&digits[position..])
+}
