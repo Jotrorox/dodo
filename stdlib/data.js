@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793094326477,
+  "lastUpdate": 1794312426550,
   "repoUrl": "https://github.com/Jotrorox/dodo",
   "entries": {
     "Standard library (Ubuntu 24.04 x86-64, -O3)": [
@@ -2690,6 +2690,1351 @@ window.BENCHMARK_DATA = {
             "range": "63623 to 66866",
             "unit": "ns/request",
             "extra": "p95 latency 1208.4 us"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Johannes Müller",
+            "username": "Jotrorox",
+            "email": "mail@jotrorox.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "2c159ad0a576fffc2aea7bd6a9a3b36f41b2abc6",
+          "message": "Merge pull request #144 from Jotrorox/attiny85\n\nAdd the Digispark board and the attiny85 chip",
+          "timestamp": "2026-11-03T16:47:36Z",
+          "url": "https://github.com/Jotrorox/dodo/commit/2c159ad0a576fffc2aea7bd6a9a3b36f41b2abc6"
+        },
+        "date": 1794312425673,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "json.parse.record -O3",
+            "value": 95.66636668911208,
+            "range": "92.732 to 98.038",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.decode.derived -O3",
+            "value": 219.52448387277175,
+            "range": "213.945 to 238.268",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.encode.derived -O3",
+            "value": 219.07761892726217,
+            "range": "212.653 to 222.201",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.parse.escaped -O3",
+            "value": 1654.5149320064131,
+            "range": "1653.141 to 1677.558",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.parse.array_256 -O3",
+            "value": 779.1828935713953,
+            "range": "772.952 to 828.504",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.parse.array_4096 -O3",
+            "value": 13402.302900247107,
+            "range": "12890.991 to 13844.527",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.parse.array_16384 -O3",
+            "value": 52084.592222806095,
+            "range": "50045.077 to 53646.924",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.parse.object_32 -O3",
+            "value": 5467.566838410146,
+            "range": "5379.588 to 5536.385",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.parse_indexed.object_32 -O3",
+            "value": 836.8918640173373,
+            "range": "827.338 to 840.514",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.parse.object_256 -O3",
+            "value": 332792.11202635913,
+            "range": "327291.942 to 339533.631",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.parse_indexed.object_256 -O3",
+            "value": 6104.986544901066,
+            "range": "6081.147 to 6158.294",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.parse.object_1024 -O3",
+            "value": 5318626.833333333,
+            "range": "5176581.472 to 5344979.111",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.parse_indexed.object_1024 -O3",
+            "value": 28460.807702850878,
+            "range": "28349.471 to 28554.935",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.string.parse.ascii -O3",
+            "value": 179.962297,
+            "range": "176.781 to 181.467",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.string.equal.ascii -O3",
+            "value": 103.61873735938279,
+            "range": "99.745 to 105.928",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.string.decoded_len.ascii -O3",
+            "value": 1.4107722324877037,
+            "range": "1.396 to 1.449",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.string.decode.ascii -O3",
+            "value": 93.32242888055005,
+            "range": "90.838 to 95.314",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.string.parse.utf8 -O3",
+            "value": 201.190548,
+            "range": "199.552 to 202.952",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.string.equal.utf8 -O3",
+            "value": 70.23584744519754,
+            "range": "68.268 to 71.529",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.string.decoded_len.utf8 -O3",
+            "value": 1.4105221392739873,
+            "range": "1.366 to 1.422",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.string.decode.utf8 -O3",
+            "value": 60.17771025782758,
+            "range": "59.162 to 60.807",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.string.parse.escaped -O3",
+            "value": 431.01670942838473,
+            "range": "420.414 to 452.091",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.string.equal.escaped -O3",
+            "value": 848.9577091802848,
+            "range": "845.913 to 864.095",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.string.decoded_len.escaped -O3",
+            "value": 549.4785340876034,
+            "range": "539.567 to 557.891",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.string.decode.escaped -O3",
+            "value": 1227.9827549473762,
+            "range": "1192.384 to 1271.958",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.parse.fixed_array_16 -O3",
+            "value": 71.65320683059495,
+            "range": "69.334 to 72.098",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.decode.fixed_array_16 -O3",
+            "value": 181.794708,
+            "range": "175.320 to 185.028",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.parse.fixed_array_64 -O3",
+            "value": 251.2868677813722,
+            "range": "243.550 to 261.020",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.decode.fixed_array_64 -O3",
+            "value": 685.562539652701,
+            "range": "674.247 to 712.969",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.parse.fixed_array_256 -O3",
+            "value": 1035.4068223053098,
+            "range": "991.146 to 1051.492",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.decode.fixed_array_256 -O3",
+            "value": 3178.740215731195,
+            "range": "3141.137 to 3877.985",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.parse_indexed.struct_16 -O3",
+            "value": 338.03702868746666,
+            "range": "324.338 to 400.027",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.decode_indexed.struct_16 -O3",
+            "value": 640.4730649188515,
+            "range": "627.300 to 645.563",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.decode.struct_16 -O3",
+            "value": 1793.8987445225011,
+            "range": "1728.918 to 1899.774",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.parse_indexed.struct_64 -O3",
+            "value": 1281.5143179881493,
+            "range": "1246.366 to 1298.407",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.decode_indexed.struct_64 -O3",
+            "value": 2790.7160853418773,
+            "range": "2740.944 to 2904.979",
+            "unit": "ns/op"
+          },
+          {
+            "name": "json.decode.struct_64 -O3",
+            "value": 23335.67208413002,
+            "range": "22212.216 to 23739.137",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.router.sorted.8 -O3",
+            "value": 29.894099186794573,
+            "range": "29.734 to 32.197",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.router.indexed.8 -O3",
+            "value": 21.58607518321204,
+            "range": "21.468 to 21.996",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.router.unsorted.8 -O3",
+            "value": 93.17645368419403,
+            "range": "91.094 to 96.660",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.decode_path -O3",
+            "value": 19.058322134979953,
+            "range": "18.121 to 19.245",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.application -O3",
+            "value": 465.7573017373713,
+            "range": "453.042 to 506.074",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.router.sorted.64 -O3",
+            "value": 45.927388619927,
+            "range": "44.871 to 46.386",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.router.indexed.64 -O3",
+            "value": 43.21004264943369,
+            "range": "41.878 to 43.946",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.router.unsorted.64 -O3",
+            "value": 541.049406709494,
+            "range": "529.227 to 554.564",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.router.sorted.256 -O3",
+            "value": 77.60763464292864,
+            "range": "76.212 to 94.647",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.router.indexed.256 -O3",
+            "value": 41.13621444372937,
+            "range": "40.135 to 41.654",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.router.unsorted.256 -O3",
+            "value": 2041.187736810344,
+            "range": "2022.052 to 2133.834",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.router.sorted.2048 -O3",
+            "value": 80.89901721517134,
+            "range": "77.602 to 83.199",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.router.indexed.2048 -O3",
+            "value": 76.41591026376317,
+            "range": "74.386 to 82.419",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.router.unsorted.2048 -O3",
+            "value": 14863.097507651946,
+            "range": "14628.369 to 15260.974",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.headers.indexed.32 -O3",
+            "value": 2191.893462580971,
+            "range": "2119.834 to 2221.131",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.headers.sequential.32 -O3",
+            "value": 130.51571986222135,
+            "range": "130.412 to 130.893",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.parameters.uncached -O3",
+            "value": 35.8865351853882,
+            "range": "35.163 to 37.592",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.parameters.captured -O3",
+            "value": 3.1878661768824483,
+            "range": "3.103 to 3.205",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.path.checked -O3",
+            "value": 49.96668207067471,
+            "range": "48.483 to 52.249",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.path.validated -O3",
+            "value": 24.61518138953236,
+            "range": "24.027 to 25.060",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.hit.scan.8 -O3",
+            "value": 102.23257222399823,
+            "range": "99.873 to 104.912",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.hit.indexed.8 -O3",
+            "value": 85.59750032308658,
+            "range": "84.683 to 86.786",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.miss.scan.8 -O3",
+            "value": 107.74236676285322,
+            "range": "107.023 to 114.501",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.miss.indexed.8 -O3",
+            "value": 98.90940890146211,
+            "range": "96.439 to 129.095",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.head.scan.8 -O3",
+            "value": 103.29992014889285,
+            "range": "100.272 to 124.727",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.head.indexed.8 -O3",
+            "value": 87.72984396038929,
+            "range": "85.652 to 93.362",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.method_not_allowed.scan.8 -O3",
+            "value": 102.79507756723389,
+            "range": "100.868 to 106.043",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.method_not_allowed.indexed.8 -O3",
+            "value": 85.96445750814854,
+            "range": "85.305 to 88.318",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.hit.scan.8 -O3",
+            "value": 248.9462280081562,
+            "range": "245.181 to 310.109",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.hit.indexed.8 -O3",
+            "value": 404.3133904268474,
+            "range": "397.532 to 410.796",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.miss.scan.8 -O3",
+            "value": 196.25181134682475,
+            "range": "194.359 to 204.966",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.miss.indexed.8 -O3",
+            "value": 363.1679711450393,
+            "range": "360.655 to 372.049",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.head.scan.8 -O3",
+            "value": 250.7169168758333,
+            "range": "247.008 to 254.625",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.head.indexed.8 -O3",
+            "value": 404.0686474765885,
+            "range": "396.454 to 493.627",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.method_not_allowed.scan.8 -O3",
+            "value": 251.78249504589894,
+            "range": "245.873 to 255.740",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.method_not_allowed.indexed.8 -O3",
+            "value": 406.695946318033,
+            "range": "398.685 to 426.660",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.hit.scan.8 -O3",
+            "value": 344.67511924982364,
+            "range": "338.604 to 356.509",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.hit.indexed.8 -O3",
+            "value": 623.5323988941041,
+            "range": "615.676 to 648.059",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.miss.scan.8 -O3",
+            "value": 293.4044548651817,
+            "range": "285.255 to 303.802",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.miss.indexed.8 -O3",
+            "value": 581.9110299251654,
+            "range": "568.429 to 694.340",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.head.scan.8 -O3",
+            "value": 351.379273647776,
+            "range": "343.742 to 358.301",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.head.indexed.8 -O3",
+            "value": 632.7445362889592,
+            "range": "626.057 to 658.223",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.method_not_allowed.scan.8 -O3",
+            "value": 340.7160182069226,
+            "range": "335.781 to 348.073",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.method_not_allowed.indexed.8 -O3",
+            "value": 624.438148463658,
+            "range": "616.040 to 780.582",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.hit.scan.8 -O3",
+            "value": 262.01828380993464,
+            "range": "255.510 to 275.804",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.hit.indexed.8 -O3",
+            "value": 503.17657274356446,
+            "range": "494.691 to 534.539",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.miss.scan.8 -O3",
+            "value": 198.594392,
+            "range": "195.536 to 201.498",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.miss.indexed.8 -O3",
+            "value": 364.2647263942981,
+            "range": "358.826 to 376.623",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.head.scan.8 -O3",
+            "value": 263.67202099090315,
+            "range": "259.875 to 269.696",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.head.indexed.8 -O3",
+            "value": 494.4971393970806,
+            "range": "488.319 to 498.550",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.method_not_allowed.scan.8 -O3",
+            "value": 267.0651458998717,
+            "range": "260.777 to 288.086",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.method_not_allowed.indexed.8 -O3",
+            "value": 511.4213761149021,
+            "range": "499.929 to 520.928",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.hit.scan.8 -O3",
+            "value": 357.2086650598334,
+            "range": "340.240 to 413.141",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.hit.indexed.8 -O3",
+            "value": 567.2290802043349,
+            "range": "549.268 to 595.186",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.miss.scan.8 -O3",
+            "value": 202.790618,
+            "range": "197.844 to 208.711",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.miss.indexed.8 -O3",
+            "value": 384.9402664311202,
+            "range": "379.712 to 391.496",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.head.scan.8 -O3",
+            "value": 358.0424197699871,
+            "range": "339.808 to 528.138",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.head.indexed.8 -O3",
+            "value": 551.3435191842605,
+            "range": "544.527 to 576.601",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.method_not_allowed.scan.8 -O3",
+            "value": 352.6890693747723,
+            "range": "329.895 to 368.827",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.method_not_allowed.indexed.8 -O3",
+            "value": 561.6931217374079,
+            "range": "542.307 to 580.578",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.hit.scan.64 -O3",
+            "value": 533.4850072887642,
+            "range": "528.734 to 573.070",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.hit.indexed.64 -O3",
+            "value": 188.116918,
+            "range": "185.235 to 214.873",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.miss.scan.64 -O3",
+            "value": 542.2755709950487,
+            "range": "535.630 to 553.971",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.miss.indexed.64 -O3",
+            "value": 231.11802014211668,
+            "range": "228.497 to 238.575",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.head.scan.64 -O3",
+            "value": 551.092276857083,
+            "range": "537.010 to 574.614",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.head.indexed.64 -O3",
+            "value": 191.374985,
+            "range": "187.151 to 196.786",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.method_not_allowed.scan.64 -O3",
+            "value": 531.8225500737111,
+            "range": "528.450 to 540.695",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.method_not_allowed.indexed.64 -O3",
+            "value": 186.039288,
+            "range": "184.869 to 188.863",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.hit.scan.64 -O3",
+            "value": 1390.8685778308532,
+            "range": "1353.240 to 1442.482",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.hit.indexed.64 -O3",
+            "value": 2255.4520505634046,
+            "range": "2217.712 to 2473.595",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.miss.scan.64 -O3",
+            "value": 1210.0695933022987,
+            "range": "1191.554 to 1240.353",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.miss.indexed.64 -O3",
+            "value": 2030.782644059313,
+            "range": "1983.569 to 2078.950",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.head.scan.64 -O3",
+            "value": 1394.5575362550264,
+            "range": "1357.331 to 1498.233",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.head.indexed.64 -O3",
+            "value": 2211.25485288392,
+            "range": "2196.639 to 2478.594",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.method_not_allowed.scan.64 -O3",
+            "value": 1378.6057746526717,
+            "range": "1360.958 to 1409.721",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.method_not_allowed.indexed.64 -O3",
+            "value": 2241.5494749414097,
+            "range": "2196.154 to 2323.813",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.hit.scan.64 -O3",
+            "value": 1993.3967590172504,
+            "range": "1976.128 to 2042.878",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.hit.indexed.64 -O3",
+            "value": 2962.813510647698,
+            "range": "2907.844 to 3052.262",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.miss.scan.64 -O3",
+            "value": 1759.8971092907377,
+            "range": "1723.280 to 1770.675",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.miss.indexed.64 -O3",
+            "value": 2792.2812018929244,
+            "range": "2766.675 to 2818.672",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.head.scan.64 -O3",
+            "value": 1995.6849631945738,
+            "range": "1987.284 to 2054.935",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.head.indexed.64 -O3",
+            "value": 2975.485699837887,
+            "range": "2930.190 to 3033.864",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.method_not_allowed.scan.64 -O3",
+            "value": 1981.5960829470791,
+            "range": "1966.234 to 2011.869",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.method_not_allowed.indexed.64 -O3",
+            "value": 2955.2599503390593,
+            "range": "2936.862 to 3900.211",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.hit.scan.64 -O3",
+            "value": 1385.968455123985,
+            "range": "1369.839 to 1438.338",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.hit.indexed.64 -O3",
+            "value": 2489.2191544871957,
+            "range": "2456.329 to 2524.841",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.miss.scan.64 -O3",
+            "value": 1190.437138114172,
+            "range": "1159.013 to 1232.549",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.miss.indexed.64 -O3",
+            "value": 2025.0848538228258,
+            "range": "1989.873 to 2097.113",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.head.scan.64 -O3",
+            "value": 1407.8458146165365,
+            "range": "1389.277 to 1663.514",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.head.indexed.64 -O3",
+            "value": 2503.0204407219067,
+            "range": "2471.749 to 2668.425",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.method_not_allowed.scan.64 -O3",
+            "value": 1396.4529304521106,
+            "range": "1380.969 to 1648.432",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.method_not_allowed.indexed.64 -O3",
+            "value": 2485.054197448794,
+            "range": "2473.190 to 2583.912",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.hit.scan.64 -O3",
+            "value": 1467.818798605133,
+            "range": "1455.264 to 1493.780",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.hit.indexed.64 -O3",
+            "value": 2314.969664833116,
+            "range": "2281.190 to 2349.121",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.miss.scan.64 -O3",
+            "value": 1173.2161817783467,
+            "range": "1153.830 to 1182.011",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.miss.indexed.64 -O3",
+            "value": 2029.0593982614653,
+            "range": "2024.948 to 2047.291",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.head.scan.64 -O3",
+            "value": 1466.4119564601167,
+            "range": "1433.840 to 1490.411",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.head.indexed.64 -O3",
+            "value": 2334.2807483516226,
+            "range": "2317.336 to 2357.767",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.method_not_allowed.scan.64 -O3",
+            "value": 1474.8355928218791,
+            "range": "1445.479 to 1501.822",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.method_not_allowed.indexed.64 -O3",
+            "value": 2321.4316785714286,
+            "range": "2301.558 to 2400.789",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.hit.scan.256 -O3",
+            "value": 1974.7955773905373,
+            "range": "1948.533 to 2044.853",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.hit.indexed.256 -O3",
+            "value": 225.51457420397182,
+            "range": "223.905 to 228.444",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.miss.scan.256 -O3",
+            "value": 1974.2564427794657,
+            "range": "1951.340 to 2083.513",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.miss.indexed.256 -O3",
+            "value": 293.8758603546209,
+            "range": "290.743 to 421.102",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.head.scan.256 -O3",
+            "value": 1996.201772344408,
+            "range": "1955.527 to 2112.501",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.head.indexed.256 -O3",
+            "value": 226.89327684743733,
+            "range": "223.505 to 234.421",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.method_not_allowed.scan.256 -O3",
+            "value": 1974.4188459502382,
+            "range": "1966.123 to 1997.716",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.method_not_allowed.indexed.256 -O3",
+            "value": 226.39206298212028,
+            "range": "224.735 to 228.428",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.hit.scan.256 -O3",
+            "value": 5181.131414855592,
+            "range": "5152.283 to 5519.206",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.hit.indexed.256 -O3",
+            "value": 9887.066596300763,
+            "range": "9827.224 to 10420.402",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.miss.scan.256 -O3",
+            "value": 4599.719078916036,
+            "range": "4503.479 to 4786.305",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.miss.indexed.256 -O3",
+            "value": 9330.821231161714,
+            "range": "9299.311 to 9531.794",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.head.scan.256 -O3",
+            "value": 5219.265637519364,
+            "range": "5098.376 to 6915.695",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.head.indexed.256 -O3",
+            "value": 9797.746626246822,
+            "range": "9693.142 to 10646.096",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.method_not_allowed.scan.256 -O3",
+            "value": 5211.7207345065035,
+            "range": "5165.962 to 5439.634",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.method_not_allowed.indexed.256 -O3",
+            "value": 10014.341959064328,
+            "range": "9781.252 to 10401.581",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.hit.scan.256 -O3",
+            "value": 7601.471359843645,
+            "range": "7557.219 to 7886.335",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.hit.indexed.256 -O3",
+            "value": 13105.492630755185,
+            "range": "12942.368 to 13380.190",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.miss.scan.256 -O3",
+            "value": 6809.48311922158,
+            "range": "6692.294 to 7063.974",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.miss.indexed.256 -O3",
+            "value": 12353.855118415944,
+            "range": "12236.684 to 12472.756",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.head.scan.256 -O3",
+            "value": 7611.656248743011,
+            "range": "7471.127 to 8025.179",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.head.indexed.256 -O3",
+            "value": 13050.863798817338,
+            "range": "12942.480 to 15919.727",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.method_not_allowed.scan.256 -O3",
+            "value": 7615.193501473459,
+            "range": "7546.367 to 7780.436",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.method_not_allowed.indexed.256 -O3",
+            "value": 13232.59244246862,
+            "range": "13019.421 to 13695.327",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.hit.scan.256 -O3",
+            "value": 5249.364470525474,
+            "range": "5232.462 to 5373.016",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.hit.indexed.256 -O3",
+            "value": 10557.498831155031,
+            "range": "10449.164 to 10588.967",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.miss.scan.256 -O3",
+            "value": 4703.075168579203,
+            "range": "4494.054 to 4833.404",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.miss.indexed.256 -O3",
+            "value": 9663.81622336656,
+            "range": "9289.851 to 9699.334",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.head.scan.256 -O3",
+            "value": 5241.744041041831,
+            "range": "5178.330 to 5392.778",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.head.indexed.256 -O3",
+            "value": 10667.16038475613,
+            "range": "10492.262 to 11049.594",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.method_not_allowed.scan.256 -O3",
+            "value": 5260.638218923933,
+            "range": "5190.521 to 5385.685",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.method_not_allowed.indexed.256 -O3",
+            "value": 10647.619616709733,
+            "range": "10515.420 to 11106.441",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.hit.scan.256 -O3",
+            "value": 5363.989770090699,
+            "range": "5315.122 to 5769.842",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.hit.indexed.256 -O3",
+            "value": 10116.459440275807,
+            "range": "10067.207 to 10216.256",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.miss.scan.256 -O3",
+            "value": 4595.094952770337,
+            "range": "4548.253 to 4647.553",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.miss.indexed.256 -O3",
+            "value": 9298.17484107466,
+            "range": "9214.689 to 11315.676",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.head.scan.256 -O3",
+            "value": 5395.595030526007,
+            "range": "5334.650 to 5621.566",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.head.indexed.256 -O3",
+            "value": 10144.98357654955,
+            "range": "10084.630 to 10317.985",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.method_not_allowed.scan.256 -O3",
+            "value": 5378.003340543797,
+            "range": "5266.921 to 5424.667",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.method_not_allowed.indexed.256 -O3",
+            "value": 10112.015198480152,
+            "range": "10069.494 to 10253.358",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.hit.scan.2048 -O3",
+            "value": 15516.063592116812,
+            "range": "14819.151 to 15762.291",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.hit.indexed.2048 -O3",
+            "value": 236.64805530843236,
+            "range": "234.019 to 240.435",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.miss.scan.2048 -O3",
+            "value": 15535.779149625743,
+            "range": "15373.179 to 15710.607",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.miss.indexed.2048 -O3",
+            "value": 308.2366345351819,
+            "range": "306.142 to 311.115",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.head.scan.2048 -O3",
+            "value": 15630.044502410876,
+            "range": "14972.388 to 15960.025",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.head.indexed.2048 -O3",
+            "value": 237.12705077272722,
+            "range": "229.176 to 241.626",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.method_not_allowed.scan.2048 -O3",
+            "value": 15297.183966954792,
+            "range": "14912.520 to 15963.276",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.distinct.method_not_allowed.indexed.2048 -O3",
+            "value": 238.01052631578946,
+            "range": "226.351 to 309.642",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.hit.scan.2048 -O3",
+            "value": 40487.64080744112,
+            "range": "39937.581 to 42358.238",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.hit.indexed.2048 -O3",
+            "value": 55493.763337893295,
+            "range": "55153.784 to 57269.181",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.miss.scan.2048 -O3",
+            "value": 36107.43295893296,
+            "range": "35745.416 to 36437.088",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.miss.indexed.2048 -O3",
+            "value": 51151.10771144278,
+            "range": "50990.604 to 51390.862",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.head.scan.2048 -O3",
+            "value": 40332.018682201684,
+            "range": "39974.312 to 41173.718",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.head.indexed.2048 -O3",
+            "value": 55419.29780128027,
+            "range": "55048.701 to 60465.603",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.method_not_allowed.scan.2048 -O3",
+            "value": 40672.642983316975,
+            "range": "39980.515 to 42202.475",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.shared.method_not_allowed.indexed.2048 -O3",
+            "value": 55463.9301369863,
+            "range": "55124.363 to 57810.909",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.hit.scan.2048 -O3",
+            "value": 61256.00738989063,
+            "range": "59380.641 to 63492.553",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.hit.indexed.2048 -O3",
+            "value": 81515.3771752327,
+            "range": "79169.896 to 89437.376",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.miss.scan.2048 -O3",
+            "value": 54528.70079863092,
+            "range": "54265.216 to 57102.795",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.miss.indexed.2048 -O3",
+            "value": 75789.86981818182,
+            "range": "73603.012 to 77745.377",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.head.scan.2048 -O3",
+            "value": 59450.15559390279,
+            "range": "58935.994 to 62879.006",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.head.indexed.2048 -O3",
+            "value": 80282.63955783656,
+            "range": "78175.753 to 81966.715",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.method_not_allowed.scan.2048 -O3",
+            "value": 59239.438273381296,
+            "range": "58042.834 to 60371.949",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.nested.method_not_allowed.indexed.2048 -O3",
+            "value": 78068.4449235594,
+            "range": "77728.144 to 78468.218",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.hit.scan.2048 -O3",
+            "value": 41114.87058331591,
+            "range": "40588.348 to 42839.286",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.hit.indexed.2048 -O3",
+            "value": 61616.868239921336,
+            "range": "60217.064 to 63954.274",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.miss.scan.2048 -O3",
+            "value": 36284.14907063197,
+            "range": "36019.662 to 36690.575",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.miss.indexed.2048 -O3",
+            "value": 51141.101269169754,
+            "range": "50897.384 to 52062.654",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.head.scan.2048 -O3",
+            "value": 41419.50853778214,
+            "range": "40399.390 to 46522.351",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.head.indexed.2048 -O3",
+            "value": 60966.67875337129,
+            "range": "60482.500 to 62244.489",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.method_not_allowed.scan.2048 -O3",
+            "value": 41106.96985555788,
+            "range": "38822.354 to 43939.313",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.wildcard.method_not_allowed.indexed.2048 -O3",
+            "value": 61082.23667905824,
+            "range": "60523.925 to 62037.739",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.hit.scan.2048 -O3",
+            "value": 41407.816305254375,
+            "range": "40342.763 to 43150.827",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.hit.indexed.2048 -O3",
+            "value": 57311.39572675293,
+            "range": "56904.933 to 57685.005",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.miss.scan.2048 -O3",
+            "value": 37958.95173041894,
+            "range": "37171.182 to 38955.604",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.miss.indexed.2048 -O3",
+            "value": 52454.34399795239,
+            "range": "51833.223 to 54101.943",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.head.scan.2048 -O3",
+            "value": 41704.4418554007,
+            "range": "41113.121 to 43271.588",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.head.indexed.2048 -O3",
+            "value": 58440.550300945826,
+            "range": "57465.950 to 60101.873",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.method_not_allowed.scan.2048 -O3",
+            "value": 41549.74904407325,
+            "range": "41322.504 to 43439.037",
+            "unit": "ns/op"
+          },
+          {
+            "name": "web.dynamic.mixed.method_not_allowed.indexed.2048 -O3",
+            "value": 59803.25667993178,
+            "range": "57277.659 to 71802.371",
+            "unit": "ns/op"
+          },
+          {
+            "name": "http.serial.c1 -O3",
+            "value": 90143.77500000001,
+            "range": "82486 to 99525",
+            "unit": "ns/request",
+            "extra": "p95 latency 110.2 us"
+          },
+          {
+            "name": "http.concurrent.c1 -O3",
+            "value": 47631.075000000004,
+            "range": "47163 to 51441",
+            "unit": "ns/request",
+            "extra": "p95 latency 55.5 us"
+          },
+          {
+            "name": "http.concurrent.c8 -O3",
+            "value": 62073.871875000004,
+            "range": "61567 to 63762",
+            "unit": "ns/request",
+            "extra": "p95 latency 1130.9 us"
           }
         ]
       }
